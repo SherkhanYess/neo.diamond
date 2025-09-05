@@ -3188,14 +3188,20 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
   );
 
   return (
-    <Section title="Настройки" right={
-      <div className="flex items-center gap-2">
-        {['pricing','users','tech'].map(k => (
-          <button key={k} onClick={()=>setTab(k)} className={`px-3 py-1.5 rounded-xl text-sm font-semibold ${tab===k? 'bg-slate-900 text-white':'bg-white border border-slate-300 text-slate-700'}`}>{k==='pricing'?'Валюты/Наценки':k==='users'?'Пользователи':'Технические'}</button>
-        ))}
-      </div>
-    }>
-      <div className="flex flex-col gap-4">
+    <Section title="Настройки">
+      <div className="flex gap-4">
+        <div className="w-48 flex-shrink-0">
+          <div className="flex flex-col gap-2">
+            {[
+              {k:'pricing',l:'Валюты/Наценки'},
+              {k:'users',l:'Пользователи'},
+              {k:'tech',l:'Технические'},
+            ].map(x => (
+              <button key={x.k} onClick={()=>setTab(x.k)} className={`text-left px-3 py-2 rounded-xl text-sm font-semibold ${tab===x.k? 'bg-slate-900 text-white':'bg-white border border-slate-300 text-slate-700'}`}>{x.l}</button>
+            ))}
+          </div>
+        </div>
+        <div className="flex-1 flex flex-col gap-4">
         {tab==='pricing' && (
           <>
             <div className="flex flex-wrap items-end gap-3">
@@ -3319,7 +3325,13 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
           <div className="font-semibold mb-2">Облако (Supabase)</div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <Input label="Supabase URL" value={settings.supabaseUrl||''} onChange={e=>setSettings({ ...settings, supabaseUrl: e.target.value })} />
-            <Input label="Supabase anon key" value={settings.supabaseAnon||''} onChange={e=>setSettings({ ...settings, supabaseAnon: e.target.value })} />
+            <label className="block text-sm mb-3">
+              <span className="block text-slate-600 mb-1">Supabase anon key</span>
+              <div className="flex items-center gap-2">
+                <input type="password" readOnly value={settings.supabaseAnon? '••••••••':'не задан'} className="w-full rounded-xl border border-slate-300 px-3 py-2 bg-slate-50" />
+                <Button variant="outline" onClick={()=>{ const v=prompt('Введите/замените Supabase anon key',''); if(v) setSettings({ ...settings, supabaseAnon: v }); }}>Изменить</Button>
+              </div>
+            </label>
             <Input label="Bucket (для фото)" value={settings.supabaseBucket||'photos'} onChange={e=>setSettings({ ...settings, supabaseBucket: e.target.value })} />
             <Input label="Организация (org)" value={settings.org||'default'} onChange={e=>setSettings({ ...settings, org: e.target.value })} />
           </div>
