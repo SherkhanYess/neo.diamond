@@ -502,7 +502,7 @@ function MasterHome({ orders, session }){
       </div>
       <Section title="Быстрый доступ">
         <div className="flex gap-2">
-          <a className="px-3 py-2 rounded-xl bg-slate-900 text-white font-semibold" href="#" onClick={(e)=>{e.preventDefault(); const ev=new Event('click'); document.querySelector('aside button:nth-child(2)')?.dispatchEvent(ev); }}>Перейти в Мои задачи →</a>
+          <a className="px-3 py-2 rounded-xl bg-slate-900 text-white font-semibold" href="#" onClick={(e)=>{e.preventDefault(); const ev=new Event('click'); document.querySelector('aside button:nth-child(2)')?.dispatchEvent(ev); }}>Перейти в Заказы →</a>
         </div>
       </Section>
     </div>
@@ -741,7 +741,8 @@ function NeoDiamondWMS() {
     if ((settings.role||'manager') === 'master') {
       return [
         { id:'home', label:'Главная', icon:'home' },
-        { id:'m_orders', label:'Мои задачи', icon:'play' },
+        { id:'m_orders', label:'Заказы', icon:'play' },
+        { id:'catalog', label:'Каталог', icon:'box' },
         { id:'earnings', label:'Мои начисления', icon:'money' },
         { id:'profile', label:'Профиль', icon:'gear' },
       ];
@@ -1116,10 +1117,11 @@ function ReorderRecommendations({ settings }) {
 
 // ------- Вид мастера: Канбан -------
 function MasterBoard({ store, session }){
-  const { orders, setOrders, models, settings } = store;
+  const { orders, setOrders, models, settings, ledger } = store;
   const me = session?.username || '';
   const allowSelf = !!(settings?.allowSelfAssignMaster);
   const [q, setQ] = React.useState('');
+  const [detailsId, setDetailsId] = React.useState(null);
 
   const setOrderPatch = (id, patch) => setOrders((os)=> os.map(o => o.id===id? { ...o, ...patch } : o));
   const takeInWork = (o) => {
@@ -1168,6 +1170,7 @@ function MasterBoard({ store, session }){
           {o.assignedTo===me && (o.masterStatus!=='В работе') && <Button variant="outline" onClick={()=>setStatus(o,'В работе')}>В работу</Button>}
           {o.assignedTo===me && (o.masterStatus==='В работе') && <Button variant="outline" onClick={()=>setStatus(o,'На проверке')}>На проверке</Button>}
           {o.assignedTo===me && (o.masterStatus==='На проверке') && <Button variant="success" onClick={()=>setStatus(o,'Готово')}>Готово</Button>}
+          <Button variant="ghost" onClick={()=>setDetailsId(o.id)}>Подробнее</Button>
         </div>
       </div>
     );
@@ -1194,6 +1197,17 @@ function MasterBoard({ store, session }){
           </div>
         ))}
       </div>
+      {detailsId && (
+        <OrderDetailsModal
+          order={orders.find(o=>o.id===detailsId)}
+          models={models}
+          settings={settings}
+          ledger={ledger}
+          onClose={()=>setDetailsId(null)}
+          onCancel={()=>{ setDetailsId(null); }}
+          onPayment={()=>{}}
+        />
+      )}
     </div>
   );
 }
@@ -1601,6 +1615,7 @@ function OrderCard({ order, models, settings, canPay, canProcess, onMoveLeft, on
 
 function OrderDetailsModal({ order, models, settings, ledger, onClose, onCancel, onPayment }) {
   if (!order) return null;
+  const perms = ROLE_PERMS[settings.role] || ROLE_PERMS.admin;
   const sumPayments = (order.payments||[]).reduce((s,p)=> s + convert(p.amount||0, p.currency||'KZT', settings.currency, settings.rates), 0);
   const lineTotal = (l) => convert(l.price||0, l.currency||'KZT', settings.currency, settings.rates) * (1 - (l.discountPct||0)/100) * (l.qty||1);
   const orderTotal = (order.lines||[]).reduce((s,l)=> s + lineTotal(l), 0);
@@ -1608,24 +1623,25 @@ function OrderDetailsModal({ order, models, settings, ledger, onClose, onCancel,
     <div className="fixed inset-0 bg-black/40 z-50 overflow-auto p-4">
       <div className="w-full max-w-3xl bg-white rounded-2xl p-4 md:p-6 border border-slate-200 mx-auto my-8 max-h-[85vh] overflow-auto">
         <div className="flex items-center justify-between mb-3"><div className="text-lg font-bold">Детали заказа</div><button className="p-2" onClick={onClose}><Icon name="x" className="w-5 h-5"/></button></div>
-        <div className="text-sm text-slate-600 mb-2">Дата: {new Date(order.createdAt).toLocaleString('ru-RU')} · Тип: {order.type} · Клиент: {order.customer||'—'}</div>
+        <div className="text-sm text-slate-600 mb-2">Дата: {new Date(order.createdAt).toLocaleString('ru-RU')} · Тип: {order.type} · Клиент: {order.customer||'—'} {order.priority? `· Приоритет: ${order.priority}`:''} {order.deadline? `· Дедлайн: ${new Date(order.deadline).toLocaleDateString('ru-RU')}`:''} {order.assignedTo? `· Назначено: ${order.assignedTo}`:''}</div>
         {order.note && <div className="text-sm text-slate-600 mb-3">Комментарий: {order.note}</div>}
         <Section title="Позиции">
           <table className="w-full text-sm">
-            <thead><tr className="text-left text-slate-500"><th className="py-2">Модель</th><th>Параметры</th><th className="text-right">Кол-во</th><th className="text-right">Сумма</th></tr></thead>
+            <thead><tr className="text-left text-slate-500"><th className="py-2">Модель</th><th>Параметры</th><th className="text-right">Кол-во</th>{perms.financeView && <th className="text-right">Сумма</th>}</tr></thead>
             <tbody>
               {(order.lines||[]).map(l=>{ const m=models.find(mm=>mm.id===l.modelId); return (
                 <tr key={l.id} className="border-t border-slate-100">
                   <td className="py-2 font-medium">{m?.name}</td>
                   <td className="text-slate-600">{m?.type} · {l.metal||m?.defaultMetal}/{l.color||m?.defaultColor}{m?.type==='Кольцо' && l.size? ` · размер ${l.size}`:''}{l.engravingEnabled && l.engraving? ` · гравировка: “${l.engraving}”`:''}</td>
                   <td className="text-right">{fmt.format(l.qty)} шт</td>
-                  <td className="text-right">{moneyFmt(lineTotal(l), settings.currency)}</td>
+                  {perms.financeView && <td className="text-right">{moneyFmt(lineTotal(l), settings.currency)}</td>}
                 </tr>
               ); })}
             </tbody>
           </table>
-          <div className="text-right mt-3 text-sm">Сумма заказа: <span className="font-semibold">{moneyFmt(orderTotal, settings.currency)}</span></div>
+          {perms.financeView && <div className="text-right mt-3 text-sm">Сумма заказа: <span className="font-semibold">{moneyFmt(orderTotal, settings.currency)}</span></div>}
         </Section>
+        {perms.financeView && (
         <Section title="Платежи">
           <div className="flex items-center justify-between mb-2"><div className="text-sm text-slate-600">Оплачено: <span className="font-semibold">{moneyFmt(sumPayments, settings.currency)}</span></div>{<Button variant="outline" onClick={()=>{ const amt=prompt(`Сумма оплаты (${settings.currency})`,'100000'); if(!amt) return; const cur=prompt('Валюта платежа (KZT/USD/EUR/...)', settings.currency)||settings.currency; const method=prompt('Метод (Kaspi/Карта/Наличными)', 'Kaspi')||'Kaspi'; const note=prompt('Комментарий','Оплата от клиента')||''; onPayment(+amt, method, note, cur); }}>Добавить оплату</Button>}</div>
           <table className="w-full text-sm">
@@ -1642,8 +1658,9 @@ function OrderDetailsModal({ order, models, settings, ledger, onClose, onCancel,
             </tbody>
           </table>
         </Section>
+        )}
         <div className="flex items-center justify-between">
-          <Button variant="outline" onClick={onCancel}>Отменить заказ</Button>
+          {perms.ordersCreate && <Button variant="outline" onClick={onCancel}>Отменить заказ</Button>}
           <div className="flex items-center gap-2">
             <Button variant="ghost" onClick={onClose}>Закрыть</Button>
           </div>
@@ -2279,6 +2296,7 @@ function ModelsBOM({ models, setModels, rawItems, settings }) {
   const [previewColors, setPreviewColors] = useState({}); // key -> color
   const [editVar, setEditVar] = useState(null); // { modelId, variantId }
   const perms = ROLE_PERMS[settings.role] || ROLE_PERMS.admin;
+  const isMaster = (settings.role||'manager') === 'master';
 
   const addModel = (m) => setModels([m, ...models]);
   const updateModel = (id, patch) => setModels(models.map(m=>m.id!==id? m : { ...m, ...patch }));
@@ -2351,10 +2369,10 @@ function ModelsBOM({ models, setModels, rawItems, settings }) {
   };
 
   const Card = ({ m }) => {
-    const cost = modelCost(m, rawItems, settings);
     const defVar = getVariant(m, m.defaultMetal||'Золото', m.defaultColor||'Белый');
+    const br = modelCostBreakdown(m, rawItems, settings, m.defaultMetal||'Золото', m.defaultColor||'Белый');
     const price = convert((defVar?.salesPrice ?? (m.salesPrice||0)), (defVar?.salesCurrency ?? (m.salesCurrency||'KZT')), settings.currency, settings.rates);
-    const margin = Math.max(0, price - cost);
+    const margin = Math.max(0, price - (br.total||0));
     return (
       <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
         <div className="flex gap-4 p-4">
@@ -2376,25 +2394,34 @@ function ModelsBOM({ models, setModels, rawItems, settings }) {
                 <div className="font-bold text-lg">{m.name}</div>
                 <div className="text-slate-500 text-sm">{m.type} · {m.defaultMetal||'—'}/{m.defaultColor||'—'}</div>
               </div>
-              <div className="text-right">
-                <div className="text-xs text-slate-500">Себестоимость</div>
-                <div className="font-semibold">{moneyFmt(cost, settings.currency)}</div>
-              </div>
+              {!isMaster && (
+                <div className="text-right">
+                  <div className="text-xs text-slate-500">Себестоимость</div>
+                  <div className="font-semibold">{moneyFmt(br.total, settings.currency)}</div>
+                </div>
+              )}
             </div>
-            <div className="grid grid-cols-3 gap-3 mt-3">
-              <div><div className="text-xs text-slate-500">Цена</div><div className="font-semibold">{moneyFmt(price, settings.currency)}</div></div>
-              <div><div className="text-xs text-slate-500">Маржа</div><div className="font-semibold">{moneyFmt(margin, settings.currency)}</div></div>
-              <div className="text-right">
-                <Button variant="outline" onClick={()=>setEditId(m.id)}>Изменить</Button>
+            {isMaster ? (
+              <div className="grid grid-cols-3 gap-3 mt-3">
+                <div><div className="text-xs text-slate-500">Работа</div><div className="font-semibold">{moneyFmt(br.labor, settings.currency)}</div></div>
+                <div><div className="text-xs text-slate-500">Металл</div><div className="font-semibold">{moneyFmt(br.metalAdd + br.plating, settings.currency)}</div></div>
+                <div></div>
               </div>
-            </div>
+            ) : (
+              <div className="grid grid-cols-3 gap-3 mt-3">
+                <div><div className="text-xs text-slate-500">Цена</div><div className="font-semibold">{moneyFmt(price, settings.currency)}</div></div>
+                <div><div className="text-xs text-slate-500">Маржа</div><div className="font-semibold">{moneyFmt(margin, settings.currency)}</div></div>
+                <div className="text-right">
+                  <Button variant="outline" onClick={()=>setEditId(m.id)}>Изменить</Button>
+                </div>
+              </div>
+            )}
             {(m.variants && m.variants.length>0) && (
               <div className="mt-2 text-xs text-slate-600">
                 Вариации: {m.variants.map(v=> (
                   <span key={v.id} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 mr-2 mb-1">
                     {v.metal}
-                    <span className="text-slate-400">·</span>
-                    {moneyFmt(convert(v.salesPrice||0, v.salesCurrency||'KZT', settings.currency, settings.rates), settings.currency)}
+                    {!isMaster && (<><span className="text-slate-400">·</span>{moneyFmt(convert(v.salesPrice||0, v.salesCurrency||'KZT', settings.currency, settings.rates), settings.currency)}</>)}
                   </span>
                 ))}
               </div>
@@ -2424,8 +2451,8 @@ function ModelsBOM({ models, setModels, rawItems, settings }) {
         </select>
         <select value={sortKey} onChange={e=>setSortKey(e.target.value)} className="rounded-xl border border-slate-300 px-2 py-1.5 text-sm">
           <option value="name">По названию</option>
-          <option value="price">По цене</option>
-          <option value="margin">По марже</option>
+          {!isMaster && <option value="price">По цене</option>}
+          {!isMaster && <option value="margin">По марже</option>}
           <option value="updated">По изменению</option>
         </select>
         <div className="ml-auto flex items-center gap-2">
@@ -2464,20 +2491,36 @@ function ModelsBOM({ models, setModels, rawItems, settings }) {
               <div className="p-4">
                 <div className="font-bold text-base leading-tight">{m.name}</div>
                 <div className="text-slate-500 text-sm mb-2">{m.type} · {v.metal}/{color}</div>
-                <div className="grid grid-cols-3 gap-3">
-                  <div>
-                    <div className="text-xs text-slate-500">Цена</div>
-                    <div className="font-semibold">{moneyFmt(price, settings.currency)}</div>
+                {isMaster ? (
+                  <div className="grid grid-cols-3 gap-3">
+                    {(() => { const br=modelCostBreakdown(m, rawItems, settings, v.metal, color); return <>
+                      <div>
+                        <div className="text-xs text-slate-500">Работа</div>
+                        <div className="font-semibold">{moneyFmt(br.labor, settings.currency)}</div>
+                      </div>
+                      <div>
+                        <div className="text-xs text-slate-500">Металл</div>
+                        <div className="font-semibold">{moneyFmt(br.metalAdd + br.plating, settings.currency)}</div>
+                      </div>
+                      <div></div>
+                    </>; })()}
                   </div>
-                  <div>
-                    <div className="text-xs text-slate-500">С/С</div>
-                    <div className="font-semibold">{moneyFmt(costCol, settings.currency)}</div>
+                ) : (
+                  <div className="grid grid-cols-3 gap-3">
+                    <div>
+                      <div className="text-xs text-slate-500">Цена</div>
+                      <div className="font-semibold">{moneyFmt(price, settings.currency)}</div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-slate-500">С/С</div>
+                      <div className="font-semibold">{moneyFmt(costCol, settings.currency)}</div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-slate-500">Маржа</div>
+                      <div className="font-semibold">{moneyFmt(marginCol, settings.currency)}</div>
+                    </div>
                   </div>
-                  <div>
-                    <div className="text-xs text-slate-500">Маржа</div>
-                    <div className="font-semibold">{moneyFmt(marginCol, settings.currency)}</div>
-                  </div>
-                </div>
+                )}
                 <div className="mt-3 flex items-center justify-between">
                   <div className="flex items-center gap-1">
                     <span className="text-xs text-slate-500">Цвет:</span>
@@ -2495,19 +2538,33 @@ function ModelsBOM({ models, setModels, rawItems, settings }) {
       ) : (
         <div className="overflow-auto bg-white rounded-2xl border border-slate-200">
           <table className="min-w-full text-sm">
-            <thead><tr className="text-left text-slate-500"><th className="py-2 px-3"><input type="checkbox" checked={allSelected} onChange={e=>toggleAll(e.target.checked)} /></th><th className="py-2 px-3">Фото</th><th>Модель</th><th>Металл</th><th>Тип</th><th className="text-right">Цена</th><th className="text-right">Себестоимость</th><th className="text-right">Маржа</th><th className="text-right">Действия</th></tr></thead>
+            {isMaster ? (
+              <thead><tr className="text-left text-slate-500"><th className="py-2 px-3"></th><th className="py-2 px-3">Фото</th><th>Модель</th><th>Металл</th><th>Тип</th><th className="text-right">Работа</th><th className="text-right">Металл</th><th className="text-right">Действия</th></tr></thead>
+            ) : (
+              <thead><tr className="text-left text-slate-500"><th className="py-2 px-3"><input type="checkbox" checked={allSelected} onChange={e=>toggleAll(e.target.checked)} /></th><th className="py-2 px-3">Фото</th><th>Модель</th><th>Металл</th><th>Тип</th><th className="text-right">Цена</th><th className="text-right">Себестоимость</th><th className="text-right">Маржа</th><th className="text-right">Действия</th></tr></thead>
+            )}
             <tbody>
               {filtered.map(({m,v,price,cost,margin,key}) => (
                 <tr key={key} className="border-t border-slate-100">
-                  <td className="py-2 px-3"><input type="checkbox" checked={!!selectedVars[key]} onChange={e=>setSelectedVars(s=>({ ...s, [key]: e.target.checked }))} /></td>
+                  <td className="py-2 px-3">{!isMaster && <input type="checkbox" checked={!!selectedVars[key]} onChange={e=>setSelectedVars(s=>({ ...s, [key]: e.target.checked }))} />}</td>
                   <td className="py-2 px-3">{(() => { const photo=getVariantPhoto(m, v, m.defaultColor||'Белый'); return photo? <img src={photo} className="w-10 h-10 object-cover rounded"/> : <span className="text-slate-400">—</span>; })()}</td>
                   <td>{m.name}</td>
                   <td>{v.metal}</td>
                   <td>{m.type}</td>
-                  <td className="text-right">{moneyFmt(price, settings.currency)}</td>
-                  <td className="text-right">{moneyFmt(cost, settings.currency)}</td>
-                  <td className="text-right">{moneyFmt(margin, settings.currency)}</td>
-                  <td className="text-right"><div className="flex gap-1 justify-end"><Button variant="outline" onClick={()=>openVariantEditor(m.id, v.id)}>Изменить вариацию</Button><Button variant="ghost" onClick={()=>setEditId(m.id)}>Модель</Button></div></td>
+                  {isMaster ? (
+                    (() => { const br=modelCostBreakdown(m, rawItems, settings, v.metal, v.color); return <>
+                      <td className="text-right">{moneyFmt(br.labor, settings.currency)}</td>
+                      <td className="text-right">{moneyFmt(br.metalAdd + br.plating, settings.currency)}</td>
+                      <td className="text-right"></td>
+                    </>; })()
+                  ) : (
+                    <>
+                      <td className="text-right">{moneyFmt(price, settings.currency)}</td>
+                      <td className="text-right">{moneyFmt(cost, settings.currency)}</td>
+                      <td className="text-right">{moneyFmt(margin, settings.currency)}</td>
+                      <td className="text-right"><div className="flex gap-1 justify-end"><Button variant="outline" onClick={()=>openVariantEditor(m.id, v.id)}>Изменить вариацию</Button><Button variant="ghost" onClick={()=>setEditId(m.id)}>Модель</Button></div></td>
+                    </>
+                  )}
                 </tr>
               ))}
             </tbody>
@@ -2591,14 +2648,16 @@ function EditVariantModal({ model, variant, rawItems, settings, onClose, onSave,
             <div className="bg-slate-50 rounded-xl border border-slate-200 p-3">
               <div className="font-semibold mb-2">Себестоимость</div>
               <div className="text-sm grid grid-cols-2 gap-1">
-                <div className="text-slate-600">BOM</div><div className="text-right font-medium">{moneyFmt(br.base, settings.currency)}</div>
+                {(settings.role||'manager')!=='master' && <><div className="text-slate-600">BOM</div><div className="text-right font-medium">{moneyFmt(br.base, settings.currency)}</div></>}
                 <div className="text-slate-600">Труд</div><div className="text-right font-medium">{moneyFmt(br.labor, settings.currency)}</div>
                 <div className="text-slate-600">Металл</div><div className="text-right font-medium">{moneyFmt(br.metalAdd, settings.currency)}</div>
                 {v.metal==='Серебро' && v.platingEnabled && <><div className="text-slate-600">Покрытие</div><div className="text-right font-medium">{moneyFmt(br.plating, settings.currency)}</div></>}
-                <div className="col-span-2 border-t my-1"/>
-                <div className="text-slate-700">Итого С/С</div><div className="text-right font-semibold">{moneyFmt(br.total, settings.currency)}</div>
-                <div className="text-slate-700">Цена</div><div className="text-right font-semibold">{moneyFmt(price, settings.currency)}</div>
-                <div className="text-slate-700">Маржа</div><div className="text-right font-semibold">{moneyFmt(Math.max(0, price - br.total), settings.currency)}</div>
+                {(settings.role||'manager')!=='master' && <>
+                  <div className="col-span-2 border-t my-1"/>
+                  <div className="text-slate-700">Итого С/С</div><div className="text-right font-semibold">{moneyFmt(br.total, settings.currency)}</div>
+                  <div className="text-slate-700">Цена</div><div className="text-right font-semibold">{moneyFmt(price, settings.currency)}</div>
+                  <div className="text-slate-700">Маржа</div><div className="text-right font-semibold">{moneyFmt(Math.max(0, price - br.total), settings.currency)}</div>
+                </>}
               </div>
             </div>
           </div>
@@ -3130,9 +3189,11 @@ function EditModelModal({ model, rawItems, settings, onClose, onSave, onUploadPh
                       )}
                     </div>
                   </div>
-                  <div className="text-xs text-slate-600 mt-2">
-                    {(() => { const br=modelCostBreakdown(local, rawItems, settings, v.metal, v.color); const price=convert(v.salesPrice||0, v.salesCurrency||'KZT', settings.currency, settings.rates); return `С/С: ${moneyFmt(br.total, settings.currency)} · Маржа: ${moneyFmt(Math.max(0, price-br.total), settings.currency)}` })()}
-                  </div>
+                  {(settings.role||'manager')!=='master' && (
+                    <div className="text-xs text-slate-600 mt-2">
+                      {(() => { const br=modelCostBreakdown(local, rawItems, settings, v.metal, v.color); const price=convert(v.salesPrice||0, v.salesCurrency||'KZT', settings.currency, settings.rates); return `С/С: ${moneyFmt(br.total, settings.currency)} · Маржа: ${moneyFmt(Math.max(0, price-br.total), settings.currency)}` })()}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -3144,14 +3205,16 @@ function EditModelModal({ model, rawItems, settings, onClose, onSave, onUploadPh
               <div className="font-semibold mb-2">Разбивка себестоимости (выбранная вариация)</div>
               {(() => { const v=(local.variants||[]).find(x=>x.id===previewVarId) || (local.variants||[])[0]; if(!v) return <div className="text-slate-500 text-sm">Нет вариаций</div>; const br=modelCostBreakdown(local, rawItems, settings, v.metal, v.color); const price=convert(v.salesPrice||0, v.salesCurrency||'KZT', settings.currency, settings.rates); return (
                 <div className="text-sm grid grid-cols-2 gap-1">
-                  <div className="text-slate-600">BOM</div><div className="text-right font-medium">{moneyFmt(br.base, settings.currency)}</div>
+                  {(settings.role||'manager')!=='master' && <><div className="text-slate-600">BOM</div><div className="text-right font-medium">{moneyFmt(br.base, settings.currency)}</div></>}
                   <div className="text-slate-600">Труд</div><div className="text-right font-medium">{moneyFmt(br.labor, settings.currency)}</div>
                   <div className="text-slate-600">Металл</div><div className="text-right font-medium">{moneyFmt(br.metalAdd, settings.currency)}</div>
                   {v.metal==='Серебро' && v.platingEnabled && <><div className="text-slate-600">Покрытие</div><div className="text-right font-medium">{moneyFmt(br.plating, settings.currency)}</div></>}
-                  <div className="col-span-2 border-t my-1"/>
-                  <div className="text-slate-700">Итого С/С</div><div className="text-right font-semibold">{moneyFmt(br.total, settings.currency)}</div>
-                  <div className="text-slate-700">Цена</div><div className="text-right font-semibold">{moneyFmt(price, settings.currency)}</div>
-                  <div className="text-slate-700">Маржа</div><div className="text-right font-semibold">{moneyFmt(Math.max(0, price - br.total), settings.currency)}</div>
+                  {(settings.role||'manager')!=='master' && <>
+                    <div className="col-span-2 border-t my-1"/>
+                    <div className="text-slate-700">Итого С/С</div><div className="text-right font-semibold">{moneyFmt(br.total, settings.currency)}</div>
+                    <div className="text-slate-700">Цена</div><div className="text-right font-semibold">{moneyFmt(price, settings.currency)}</div>
+                    <div className="text-slate-700">Маржа</div><div className="text-right font-semibold">{moneyFmt(Math.max(0, price - br.total), settings.currency)}</div>
+                  </>}
                 </div>
               ); })()}
             </div>
