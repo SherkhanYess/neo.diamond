@@ -205,7 +205,18 @@ const seedModels = (raw) => {
   ];
 };
 
-const STATUSES = ["Новый", "В производстве", "Готово", "Доставлено"];
+// Этапы канбана для всех пользователей
+const STATUSES = [
+  "Новые заказы",
+  "Взят в работу",
+  "Оправа отлита",
+  "Отполировано",
+  "Камни закреплены",
+  "Клеймо нанесено",
+  "Сервис предоставлен",
+  "Доставлено",
+  "Завершено",
+];
 const METHODS = ["Наличными", "Карта", "Перевод", "Kaspi", "Другое"];
 
 // ------- Хук хранилища -------
@@ -721,7 +732,7 @@ function NeoDiamondWMS() {
   const metrics = useMemo(() => {
     const rawValue = rawItems.reduce((s, r) => s + convert((r.costPerUnit||0) * (r.stockQty||0), r.currency||'KZT', settings.currency, settings.rates), 0);
     const fgCount = jewelryStock.reduce((s, j) => s + j.qty, 0);
-    const openOrders = orders.filter(o => ["Новый", "В производстве", "Готово"].includes(o.status)).length;
+    const openOrders = orders.filter(o => o.status !== 'Завершено').length;
     const todayIn = ledger
       .filter(l => l.type === "PAYMENT" && l.date?.slice(0,10) === todayISO())
       .reduce((s, l) => s + convert(l.payload?.amount||0, l.payload?.currency||'KZT', settings.currency, settings.rates), 0);
@@ -1122,6 +1133,7 @@ function MasterBoard({ store, session }){
   const allowSelf = !!(settings?.allowSelfAssignMaster);
   const [q, setQ] = React.useState('');
   const [detailsId, setDetailsId] = React.useState(null);
+  const pieceRate = (mid)=>{ const m=models.find(x=>x.id===mid); const r=+(m?.pieceRate||0); const cur=m?.pieceCurrency||'KZT'; return convert(r, cur, settings.currency, settings.rates); };
 
   const setOrderPatch = (id, patch) => setOrders((os)=> os.map(o => o.id===id? { ...o, ...patch } : o));
   const takeInWork = (o) => {
@@ -1153,6 +1165,9 @@ function MasterBoard({ store, session }){
     'Готово': myOrders.filter(o => (o.masterStatus||'')==='Готово'),
   };
   const columns = allowSelf? ['Неназначено','В работе','На проверке','Готово'] : ['В работе','На проверке','Готово'];
+  // Суммарные показатели
+  const earned = myOrders.filter(o => (o.masterStatus||'')==='Готово').reduce((s,o)=> s + (o.lines||[]).reduce((x,l)=> x + pieceRate(l.modelId)*(l.qty||1), 0), 0);
+  const available = myOrders.filter(o => (o.masterStatus||'')!=='Готово').reduce((s,o)=> s + (o.lines||[]).reduce((x,l)=> x + pieceRate(l.modelId)*(l.qty||1), 0), 0);
   const card = (o) => {
     const first = (o.lines||[])[0];
     const m = models.find(mm=>mm.id===first?.modelId);
@@ -1177,12 +1192,16 @@ function MasterBoard({ store, session }){
   };
   return (
     <div>
-      <div className="flex flex-col md:flex-row md:items-center gap-3 mb-4">
+      <div className="flex flex-col md:flex-row md:items-center gap-3 mb-2">
         <div className="relative">
           <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Поиск по ID" className="w-72 rounded-xl border border-slate-300 pl-9 pr-3 py-2"/>
           <span className="absolute left-2.5 top-2.5 text-slate-400"><Icon name="search"/></span>
         </div>
         <div className="md:ml-auto text-sm text-slate-600">Вид только для мастера: без цен и оплат.</div>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
+        <div className="p-3 bg-white rounded-xl border border-slate-200"><div className="text-slate-500 text-xs">Доступный заработок</div><div className="text-xl font-bold">{moneyFmt(available, settings.currency)}</div></div>
+        <div className="p-3 bg-white rounded-xl border border-slate-200"><div className="text-slate-500 text-xs">Уже заработано</div><div className="text-xl font-bold">{moneyFmt(earned, settings.currency)}</div></div>
       </div>
       <div className="flex gap-4 overflow-auto pb-2">
         {columns.map(st => (
@@ -1458,7 +1477,7 @@ function OrdersBoard({ store }) {
 
   const createOrder = (order) => {
     const id = uid();
-    setOrders([ { ...order, id, createdAt: new Date().toISOString(), status: "Новый", payments: order.payments || [] }, ...orders ]);
+    setOrders([ { ...order, id, createdAt: new Date().toISOString(), status: "Новые заказы", payments: order.payments || [] }, ...orders ]);
     if (order.initialPayment && order.initialPayment>0) {
       const method = order.initialPaymentMethod||"Kaspi";
       const currency = settings.currency;
@@ -1490,7 +1509,7 @@ function OrdersBoard({ store }) {
           setLedger(l => [{ id: uid(), type: "FG_OUT", date: new Date().toISOString(), refId: order.id, payload:{ model: model.name, qty: line.qty } }, ...l]);
         }
       });
-      setStatus(order.id, order.type === 'Клиентский'? 'Готово' : 'Готово');
+      setStatus(order.id, 'Завершено');
       showToast('Операция выполнена успешно', 'success');
     } catch (e) {
       showToast(e.message || 'Ошибка операции', 'error');
@@ -1581,13 +1600,17 @@ function OrderCard({ order, models, settings, canPay, canProcess, onMoveLeft, on
       <div className="mt-2 text-sm">
         {order.lines.slice(0,1).map(l=> {
           const m = models.find(mm=>mm.id===l.modelId);
+          const bom = (m?.bom||[]).map(b=>{ const r=loadLS('nd_raw',[]).find(x=>x.id===b.rawItemId); return { name: r?.name||'—', qty: (b.qty||0)*(l.qty||1) }; });
           return (
-            <div key={l.id} className="flex items-center justify-between py-1 border-t border-slate-200">
-              <div>
-                <div className="font-medium">{m?.name} · {l.metal||m?.defaultMetal}/{l.color||m?.defaultColor}</div>
-                <div className="text-slate-500">{m?.type} · сумма заказа: {moneyFmt(orderTotal, settings.currency)}</div>
+            <div key={l.id} className="py-1 border-t border-slate-200">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="font-medium">{m?.name} · {l.metal||m?.defaultMetal}/{l.color||m?.defaultColor}</div>
+                  <div className="text-slate-500 text-xs">{m?.type} · {fmt.format(l.qty||1)} шт</div>
+                </div>
+                <Button variant="outline" onClick={onDetails}>Подробнее</Button>
               </div>
-              <Button variant="outline" onClick={onDetails}>Подробнее</Button>
+              {bom.length>0 && <div className="text-xs text-slate-500 mt-1">BOM: {bom.map(x=>`${x.name} × ${fmt.format(x.qty)}`).join('; ')}</div>}
             </div>
           );
         })}
@@ -1619,23 +1642,56 @@ function OrderDetailsModal({ order, models, settings, ledger, onClose, onCancel,
   const sumPayments = (order.payments||[]).reduce((s,p)=> s + convert(p.amount||0, p.currency||'KZT', settings.currency, settings.rates), 0);
   const lineTotal = (l) => convert(l.price||0, l.currency||'KZT', settings.currency, settings.rates) * (1 - (l.discountPct||0)/100) * (l.qty||1);
   const orderTotal = (order.lines||[]).reduce((s,l)=> s + lineTotal(l), 0);
+  const firstLine = (order.lines||[])[0];
+  const firstModel = models.find(mm=>mm.id===firstLine?.modelId);
+  const firstVar = firstModel? getVariant(firstModel, firstLine?.metal||firstModel.defaultMetal, firstLine?.color||firstModel.defaultColor): null;
+  const firstPhoto = firstModel? getVariantPhoto(firstModel, firstVar, firstLine?.color||firstModel?.defaultColor): null;
+  const pieceRate = (mid)=>{ const m=models.find(x=>x.id===mid); const r=+(m?.pieceRate||0); const cur=m?.pieceCurrency||'KZT'; return convert(r, cur, settings.currency, settings.rates); };
   return (
     <div className="fixed inset-0 bg-black/40 z-50 overflow-auto p-4">
       <div className="w-full max-w-3xl bg-white rounded-2xl p-4 md:p-6 border border-slate-200 mx-auto my-8 max-h-[85vh] overflow-auto">
         <div className="flex items-center justify-between mb-3"><div className="text-lg font-bold">Детали заказа</div><button className="p-2" onClick={onClose}><Icon name="x" className="w-5 h-5"/></button></div>
-        <div className="text-sm text-slate-600 mb-2">Дата: {new Date(order.createdAt).toLocaleString('ru-RU')} · Тип: {order.type} · Клиент: {order.customer||'—'} {order.priority? `· Приоритет: ${order.priority}`:''} {order.deadline? `· Дедлайн: ${new Date(order.deadline).toLocaleDateString('ru-RU')}`:''} {order.assignedTo? `· Назначено: ${order.assignedTo}`:''}</div>
-        {order.note && <div className="text-sm text-slate-600 mb-3">Комментарий: {order.note}</div>}
+        {firstPhoto && <div className="w-full aspect-[3/2] bg-slate-100 rounded-xl overflow-hidden mb-3"> <img src={firstPhoto} className="w-full h-full object-cover"/> </div>}
+        <div className="text-sm text-slate-700 grid grid-cols-1 gap-1 mb-3">
+          <div>Дата: <b>{new Date(order.createdAt).toLocaleString('ru-RU')}</b></div>
+          <div>Тип: <b>{order.type}</b></div>
+          <div>Клиент: <b>{order.customer||'—'}</b></div>
+          {order.priority && <div>Приоритет: <b>{order.priority}</b></div>}
+          {order.deadline && <div>Дедлайн: <b>{new Date(order.deadline).toLocaleDateString('ru-RU')}</b></div>}
+          {order.assignedTo && <div>Назначено: <b>{order.assignedTo}</b></div>}
+          {order.note && <div>Комментарий: <b className="font-normal text-slate-600">{order.note}</b></div>}
+        </div>
         <Section title="Позиции">
           <table className="w-full text-sm">
             <thead><tr className="text-left text-slate-500"><th className="py-2">Модель</th><th>Параметры</th><th className="text-right">Кол-во</th>{perms.financeView && <th className="text-right">Сумма</th>}</tr></thead>
             <tbody>
-              {(order.lines||[]).map(l=>{ const m=models.find(mm=>mm.id===l.modelId); return (
-                <tr key={l.id} className="border-t border-slate-100">
-                  <td className="py-2 font-medium">{m?.name}</td>
-                  <td className="text-slate-600">{m?.type} · {l.metal||m?.defaultMetal}/{l.color||m?.defaultColor}{m?.type==='Кольцо' && l.size? ` · размер ${l.size}`:''}{l.engravingEnabled && l.engraving? ` · гравировка: “${l.engraving}”`:''}</td>
-                  <td className="text-right">{fmt.format(l.qty)} шт</td>
-                  {perms.financeView && <td className="text-right">{moneyFmt(lineTotal(l), settings.currency)}</td>}
-                </tr>
+              {(order.lines||[]).map(l=>{ const m=models.find(mm=>mm.id===l.modelId); const v = m? getVariant(m, l.metal||m.defaultMetal, l.color||m.defaultColor): null; const br = m? modelCostBreakdown(m, loadLS('nd_raw',[]), settings, l.metal||m?.defaultMetal, l.color||m?.defaultColor): {base:0, labor:0, metalAdd:0, plating:0, total:0}; const metalCost = (br.metalAdd + br.plating) * (l.qty||1); const earn = pieceRate(l.modelId) * (l.qty||1); const bom = (m?.bom||[]).map(b=>{ const r=loadLS('nd_raw',[]).find(x=>x.id===b.rawItemId); return { name:r?.name||'—', qty:(b.qty||0)*(l.qty||1) }; }); return (
+                <React.Fragment key={l.id}>
+                  <tr className="border-t border-slate-100">
+                    <td className="py-2 font-medium">{m?.name}</td>
+                    <td className="text-slate-600">{m?.type} · {l.metal||m?.defaultMetal}/{l.color||m?.defaultColor}{m?.type==='Кольцо' && l.size? ` · размер ${l.size}`:''}{l.engravingEnabled && l.engraving? ` · гравировка: “${l.engraving}”`:''}</td>
+                    <td className="text-right">{fmt.format(l.qty)} шт</td>
+                    {perms.financeView && <td className="text-right">{moneyFmt(lineTotal(l), settings.currency)}</td>}
+                  </tr>
+                  <tr className="text-xs text-slate-600">
+                    <td colSpan={perms.financeView?4:3} className="py-1">
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                        <div>
+                          <div className="text-slate-500">BOM:</div>
+                          <div>{bom.map(x=> `${x.name} × ${fmt.format(x.qty)}`).join('; ')||'—'}</div>
+                        </div>
+                        <div>
+                          <div className="text-slate-500">Металл:</div>
+                          <div className="font-medium">{moneyFmt(metalCost, settings.currency)}</div>
+                        </div>
+                        <div>
+                          <div className="text-slate-500">Работа мастера:</div>
+                          <div className="font-medium">{moneyFmt(earn, settings.currency)}</div>
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                </React.Fragment>
               ); })}
             </tbody>
           </table>
@@ -2368,11 +2424,13 @@ function ModelsBOM({ models, setModels, rawItems, settings }) {
     setEditVar(null);
   };
 
+  const pieceRateFor = (mid)=>{ const md=models.find(x=>x.id===mid); const r=+(md?.pieceRate||0); const cur=md?.pieceCurrency||'KZT'; return convert(r, cur, settings.currency, settings.rates); };
   const Card = ({ m }) => {
     const defVar = getVariant(m, m.defaultMetal||'Золото', m.defaultColor||'Белый');
     const br = modelCostBreakdown(m, rawItems, settings, m.defaultMetal||'Золото', m.defaultColor||'Белый');
     const price = convert((defVar?.salesPrice ?? (m.salesPrice||0)), (defVar?.salesCurrency ?? (m.salesCurrency||'KZT')), settings.currency, settings.rates);
     const margin = Math.max(0, price - (br.total||0));
+    const bomText = (m.bom||[]).map(b=>{ const r=rawItems.find(x=>x.id===b.rawItemId); return `${r?.name||'—'} × ${fmt.format(b.qty||0)}`; }).join('; ');
     return (
       <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
         <div className="flex gap-4 p-4">
@@ -2403,7 +2461,7 @@ function ModelsBOM({ models, setModels, rawItems, settings }) {
             </div>
             {isMaster ? (
               <div className="grid grid-cols-3 gap-3 mt-3">
-                <div><div className="text-xs text-slate-500">Работа</div><div className="font-semibold">{moneyFmt(br.labor, settings.currency)}</div></div>
+                <div><div className="text-xs text-slate-500">Работа (ставка)</div><div className="font-semibold">{moneyFmt(pieceRateFor(m.id), settings.currency)}</div></div>
                 <div><div className="text-xs text-slate-500">Металл</div><div className="font-semibold">{moneyFmt(br.metalAdd + br.plating, settings.currency)}</div></div>
                 <div></div>
               </div>
@@ -2416,6 +2474,7 @@ function ModelsBOM({ models, setModels, rawItems, settings }) {
                 </div>
               </div>
             )}
+            <div className="mt-2 text-xs text-slate-600"><span className="text-slate-500">BOM:</span> {bomText||'—'}</div>
             {(m.variants && m.variants.length>0) && (
               <div className="mt-2 text-xs text-slate-600">
                 Вариации: {m.variants.map(v=> (
@@ -2493,10 +2552,10 @@ function ModelsBOM({ models, setModels, rawItems, settings }) {
                 <div className="text-slate-500 text-sm mb-2">{m.type} · {v.metal}/{color}</div>
                 {isMaster ? (
                   <div className="grid grid-cols-3 gap-3">
-                    {(() => { const br=modelCostBreakdown(m, rawItems, settings, v.metal, color); return <>
+                    {(() => { const br=modelCostBreakdown(m, rawItems, settings, v.metal, color); const pr=(()=>{ const r=+(m?.pieceRate||0); const cur=m?.pieceCurrency||'KZT'; return convert(r, cur, settings.currency, settings.rates); })(); return <>
                       <div>
-                        <div className="text-xs text-slate-500">Работа</div>
-                        <div className="font-semibold">{moneyFmt(br.labor, settings.currency)}</div>
+                        <div className="text-xs text-slate-500">Работа (ставка)</div>
+                        <div className="font-semibold">{moneyFmt(pr, settings.currency)}</div>
                       </div>
                       <div>
                         <div className="text-xs text-slate-500">Металл</div>
@@ -2528,7 +2587,7 @@ function ModelsBOM({ models, setModels, rawItems, settings }) {
                       <button key={c} onClick={()=>setPreviewColors(pc=>({ ...pc, [key]: c }))} className={`px-2 py-1 rounded-lg text-xs font-semibold ${ (previewColors[key]||'Белый')===c? 'bg-slate-900 text-white':'bg-white border border-slate-300 text-slate-700'}`}>{c}</button>
                     ))}
                   </div>
-                  <Button variant="outline" onClick={()=>openVariantEditor(m.id, v.id)}>Изменить</Button>
+                  {!isMaster && <Button variant="outline" onClick={()=>openVariantEditor(m.id, v.id)}>Изменить</Button>}
                 </div>
               </div>
             </div>
@@ -2539,7 +2598,7 @@ function ModelsBOM({ models, setModels, rawItems, settings }) {
         <div className="overflow-auto bg-white rounded-2xl border border-slate-200">
           <table className="min-w-full text-sm">
             {isMaster ? (
-              <thead><tr className="text-left text-slate-500"><th className="py-2 px-3"></th><th className="py-2 px-3">Фото</th><th>Модель</th><th>Металл</th><th>Тип</th><th className="text-right">Работа</th><th className="text-right">Металл</th><th className="text-right">Действия</th></tr></thead>
+              <thead><tr className="text-left text-slate-500"><th className="py-2 px-3"></th><th className="py-2 px-3">Фото</th><th>Модель</th><th>Металл</th><th>Тип</th><th className="text-right">Работа</th><th className="text-right">Металл</th><th>BOM</th><th className="text-right">Действия</th></tr></thead>
             ) : (
               <thead><tr className="text-left text-slate-500"><th className="py-2 px-3"><input type="checkbox" checked={allSelected} onChange={e=>toggleAll(e.target.checked)} /></th><th className="py-2 px-3">Фото</th><th>Модель</th><th>Металл</th><th>Тип</th><th className="text-right">Цена</th><th className="text-right">Себестоимость</th><th className="text-right">Маржа</th><th className="text-right">Действия</th></tr></thead>
             )}
@@ -2552,9 +2611,10 @@ function ModelsBOM({ models, setModels, rawItems, settings }) {
                   <td>{v.metal}</td>
                   <td>{m.type}</td>
                   {isMaster ? (
-                    (() => { const br=modelCostBreakdown(m, rawItems, settings, v.metal, v.color); return <>
-                      <td className="text-right">{moneyFmt(br.labor, settings.currency)}</td>
+                    (() => { const br=modelCostBreakdown(m, rawItems, settings, v.metal, v.color); const pr=(()=>{ const r=+(m?.pieceRate||0); const cur=m?.pieceCurrency||'KZT'; return convert(r, cur, settings.currency, settings.rates); })(); const bomTxt=(m.bom||[]).map(b=>{ const r=rawItems.find(x=>x.id===b.rawItemId); return `${r?.name||'—'} × ${fmt.format(b.qty||0)}`; }).join('; '); return <>
+                      <td className="text-right">{moneyFmt(pr, settings.currency)}</td>
                       <td className="text-right">{moneyFmt(br.metalAdd + br.plating, settings.currency)}</td>
+                      <td className="text-xs text-slate-600">{bomTxt||'—'}</td>
                       <td className="text-right"></td>
                     </>; })()
                   ) : (
