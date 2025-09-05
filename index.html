@@ -3271,45 +3271,9 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
           <UsersTab />
         )}
 
-        {tab==='tech' && (
-        <div className="bg-white rounded-2xl border border-slate-200 p-4">
-          <div className="flex items-center justify-between mb-3">
-            <div className="font-semibold">Курсы валют (KZT за 1 единицу)</div>
-            {perms.ratesEdit && <Button variant="outline" onClick={addCurrency}><Icon name="plus"/> Добавить валюту</Button>}
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            {codes.map(code => (
-              <div key={code} className="flex items-center gap-2">
-                <div className="w-20 font-semibold">{code}</div>
-                <input type="number" className="w-40 rounded-xl border border-slate-300 px-3 py-2" value={settings.rates[code]} onChange={e=>perms.ratesEdit && setRate(code, e.target.value)} disabled={!perms.ratesEdit} />
-                {perms.ratesEdit && code!=='KZT' && <Button variant="danger" onClick={()=>removeCurrency(code)}><Icon name="trash"/></Button>}
-              </div>
-            ))}
-          </div>
-        </div>
-        )}
+        
 
-        {tab==='tech' && (
-        <div className="bg-white rounded-2xl border border-slate-200 p-4">
-          <div className="font-semibold mb-2">Наценка для золота (KZT, к базовой себестоимости)</div>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
-            {[
-              ['Кольцо', 180000],
-              ['Серьги', 300000],
-              ['Подвеска', 200000],
-              ['Пусеты', 225000],
-            ].map(([t, def]) => (
-              <label key={t} className="block text-sm">
-                <span className="block text-slate-600 mb-1">{t}</span>
-                <input type="number" value={(settings.goldMarkupByType||{})[t]??def}
-                  onChange={e=> setSettings({ ...settings, goldMarkupByType: { ...(settings.goldMarkupByType||{}), [t]: +e.target.value } })}
-                  className="w-full rounded-xl border border-slate-300 px-3 py-2" />
-              </label>
-            ))}
-          </div>
-          <div className="text-xs text-slate-500 mt-2">Применяется автоматически только для металла “Золото”. Для серебра используется базовая себестоимость (без наценки).</div>
-        </div>
-        )}
+        
 
         <div className="flex flex-wrap items-center gap-3">
           <Button onClick={exportJSON}><Icon name="download"/> Экспортировать JSON</Button>
@@ -3419,6 +3383,7 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
           </div>
           <div className="text-xs text-slate-500 mt-2">Подробности и SQL для таблиц см. в README.md (раздел Supabase).</div>
         </div>
+      </div>
       </div>
     </Section>
   );
