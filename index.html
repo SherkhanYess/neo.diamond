@@ -216,6 +216,7 @@ function useStore() {
   const [suppliers, setSuppliers] = useState(() => loadLS("nd_suppliers", seedSuppliers()));
   const [pos, setPOs] = useState(() => loadLS("nd_pos", [])); // закупки
   const [services, setServices] = useState(() => loadLS("nd_services", seedServices()));
+  const [users, setUsers] = useState(() => loadLS("nd_users", []));
 
   // Миграции
   useEffect(()=>{
@@ -265,6 +266,7 @@ function useStore() {
   useEffect(() => saveLS("nd_orders", orders), [orders]);
   useEffect(() => saveLS("nd_ledger", ledger), [ledger]);
   useEffect(() => saveLS("nd_settings", settings), [settings]);
+  useEffect(() => saveLS("nd_users", users), [users]);
 
   // Cloud-first загрузка при старте
   const cloudLoadedRef = React.useRef(false);
@@ -305,7 +307,7 @@ function useStore() {
   useEffect(()=>{
     if (!settings?.supabaseAuto) return;
     if (!settings?.supabaseUrl || !settings?.supabaseAnon) return;
-    const payload = { version: SCHEMA_VERSION, rawItems, models, jewelryStock, orders, ledger, settings, suppliers, pos, services, savedAt: new Date().toISOString() };
+    const payload = { version: SCHEMA_VERSION, rawItems, models, jewelryStock, orders, ledger, settings, suppliers, pos, services, users: loadLS('nd_users', []), savedAt: new Date().toISOString() };
     autoCloudSave(payload);
   }, [rawItems, models, jewelryStock, orders, ledger, suppliers, pos, services, settings.supabaseUrl, settings.supabaseAnon, settings.org, settings.supabaseAuto]);
   useEffect(() => saveLS("nd_suppliers", suppliers), [suppliers]);
@@ -326,7 +328,7 @@ function useStore() {
   };
 
   const exportJSON = () => {
-    const blob = new Blob([JSON.stringify({ version: SCHEMA_VERSION, rawItems, models, jewelryStock, orders, ledger, settings, suppliers, pos }, null, 2)], { type: 'application/json' });
+    const blob = new Blob([JSON.stringify({ version: SCHEMA_VERSION, rawItems, models, jewelryStock, orders, ledger, settings, suppliers, pos, services, users }, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url; a.download = `neo-diamond-warehouse-${todayISO()}.json`; a.click(); URL.revokeObjectURL(url);
@@ -344,10 +346,11 @@ function useStore() {
     if (data.suppliers) setSuppliers(data.suppliers);
     if (data.pos) setPOs(data.pos);
     if (data.services) setServices(data.services);
+    if (data.users) setUsers(data.users);
     saveVersion(data.version ? +data.version : SCHEMA_VERSION);
   };
 
-  return { rawItems, setRawItems, models, setModels, jewelryStock, setJewelryStock, orders, setOrders, ledger, setLedger, settings, setSettings, suppliers, setSuppliers, services, setServices, pos, setPOs, resetAll, exportJSON, importJSON };
+  return { rawItems, setRawItems, models, setModels, jewelryStock, setJewelryStock, orders, setOrders, ledger, setLedger, settings, setSettings, suppliers, setSuppliers, services, setServices, users, setUsers, pos, setPOs, resetAll, exportJSON, importJSON };
 }
 
 // ------- Компоненты UI -------
@@ -661,11 +664,14 @@ function issueFG(jewelryStock, setJewelryStock, modelId, metal, color, qty) {
 // ------- Главный компонент -------
 function NeoDiamondWMS() {
   const store = useStore();
-  const { rawItems, setRawItems, models, setModels, jewelryStock, setJewelryStock, orders, setOrders, ledger, setLedger, settings, setSettings, suppliers, setSuppliers, services, setServices, pos, setPOs, resetAll, exportJSON, importJSON } = store;
+  const { rawItems, setRawItems, models, setModels, jewelryStock, setJewelryStock, orders, setOrders, ledger, setLedger, settings, setSettings, suppliers, setSuppliers, services, setServices, users, setUsers, pos, setPOs, resetAll, exportJSON, importJSON } = store;
+  const [session, setSession] = useState(() => loadLS('nd_session', null));
+  useEffect(()=> saveLS('nd_session', session), [session]);
 
   // Новая навигация
   const [section, setSection] = useState('home');
   const [sub, setSub] = useState({ warehouse:'raw', purchases:'suppliers', analytics:'cost', planning:'capacity' });
+  const isLogged = !!session;
 
   // Метрики
   const metrics = useMemo(() => {
@@ -700,6 +706,7 @@ function NeoDiamondWMS() {
   ];
 
   const renderContent = () => {
+    if (!isLogged) return <LoginScreen users={users} onCreateAdmin={(u)=>{ setUsers([u]); setSession({ username:u.username, role:u.role }); setSettings({ ...settings, role:u.role }); showToast('Администратор создан','success'); }} onLogin={(s)=>{ setSession(s); setSettings({ ...settings, role:s.role }); showToast('Вход выполнен','success'); }} />;
     if (section==='home') return <Dashboard metrics={metrics} rawItems={rawItems} jewelryStock={jewelryStock} orders={orders} ledger={ledger} models={models} settings={settings} setSection={setSection} />;
     if (section==='orders') return <OrdersBoard store={store} />;
     if (section==='catalog') {
@@ -731,7 +738,7 @@ function NeoDiamondWMS() {
       if (s==='capacity') return <Capacity models={models} rawItems={rawItems} settings={settings} setTab={()=>{}} />;
       if (s==='reorder') return <Section title="Рекомендации закупок"><ReorderRecommendations settings={settings} /></Section>;
     }
-    if (section==='settings') return <Backup exportJSON={exportJSON} importJSON={importJSON} resetAll={resetAll} settings={settings} setSettings={setSettings} />;
+    if (section==='settings') return <Backup exportJSON={exportJSON} importJSON={importJSON} resetAll={resetAll} settings={settings} setSettings={setSettings} users={users} setUsers={setUsers} />;
     return null;
   };
 
@@ -775,9 +782,10 @@ function NeoDiamondWMS() {
                 {Object.keys(settings.rates).map(c=> <option key={c} value={c}>{c}</option>)}
               </select>
               <label className="text-xs text-slate-500 ml-2">Роль</label>
-              <select value={settings.role} onChange={e=>setSettings({ ...settings, role: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1 text-sm">
+              <select disabled={isLogged} value={settings.role} onChange={e=>setSettings({ ...settings, role: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1 text-sm disabled:opacity-50">
                 {['admin','manager','master'].map(r=> <option key={r} value={r}>{r}</option>)}
               </select>
+              {isLogged && <Button variant="outline" onClick={()=>{ setSession(null); setSettings({ ...settings, role:'manager' }); showToast('Вы вышли из аккаунта','info'); }}>Выйти</Button>}
             </div>
           </div>
         </header>
@@ -789,6 +797,53 @@ function NeoDiamondWMS() {
         </main>
         <footer className="px-4 md:px-6 py-6 text-xs text-slate-500">Сделано для Neo Diamond · локальное хранение</footer>
         <Toasts />
+      </div>
+    </div>
+  );
+}
+
+async function sha256Hex(text) {
+  const data = new TextEncoder().encode(text);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hash)).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+function randomSalt(len=16){ const a=new Uint8Array(len); crypto.getRandomValues(a); return Array.from(a).map(b=>b.toString(16).padStart(2,'0')).join(''); }
+
+function LoginScreen({ users, onCreateAdmin, onLogin }){
+  const [username, setUsername] = React.useState('');
+  const [password, setPassword] = React.useState('');
+  const [role, setRole] = React.useState('admin');
+  const [err, setErr] = React.useState('');
+  const empty = !users || users.length===0;
+  const submit = async ()=>{
+    try{
+      setErr('');
+      if (empty){
+        if (!username || !password) { setErr('Заполните логин и пароль'); return; }
+        const salt = randomSalt();
+        const passHash = await sha256Hex(salt + password);
+        onCreateAdmin({ id: uid(), username, role, salt, passHash, active:true });
+        return;
+      }
+      const u = users.find(x=>x.username===username && x.active!==false);
+      if (!u) { setErr('Неверный логин или пароль'); return; }
+      const ok = (await sha256Hex(u.salt + password)) === u.passHash;
+      if (!ok){ setErr('Неверный логин или пароль'); return; }
+      onLogin({ username: u.username, role: u.role });
+    }catch(e){ setErr('Ошибка входа'); console.error(e); }
+  };
+  return (
+    <div className="min-h-screen bg-slate-50 grid place-items-center p-4">
+      <div className="w-full max-w-sm bg-white rounded-2xl p-5 border border-slate-200 shadow-sm">
+        <div className="text-lg font-bold mb-3">{empty? 'Создать администратора':'Вход'}</div>
+        {err && <div className="mb-2 text-sm text-red-600">{err}</div>}
+        <Input label="Логин" value={username} onChange={e=>setUsername(e.target.value)} />
+        <Input label="Пароль" type="password" value={password} onChange={e=>setPassword(e.target.value)} />
+        {empty && <Select label="Роль" value={role} onChange={setRole} options={['admin','manager','master']} />}
+        <div className="flex items-center justify-end gap-2 mt-2">
+          <Button onClick={submit}><Icon name="check"/> {empty? 'Создать и войти':'Войти'}</Button>
+        </div>
+        <div className="text-xs text-slate-500 mt-3">Вход по логину и паролю. Пароль хранится в виде SHA‑256 хеша с солью.</div>
       </div>
     </div>
   );
@@ -3071,8 +3126,9 @@ function AnalyticsStockDaysModels({ models, jewelryStock, orders }) {
 }
 
 // ------- Резерв/Настройки -------
-function Backup({ exportJSON, importJSON, resetAll, settings, setSettings }) {
+function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users, setUsers }) {
   const perms = ROLE_PERMS[settings.role] || ROLE_PERMS.admin;
+  const [tab, setTab] = React.useState('pricing'); // pricing | users | tech
   const codes = Object.keys(settings.rates);
   const setRate = (code, val) => setSettings({ ...settings, rates: { ...settings.rates, [code]: +val || 0 } });
   const addCurrency = () => {
@@ -3089,9 +3145,106 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings }) {
     setSettings({ ...settings, currency: nextCurrency, rates: r });
   };
 
+  const UsersTab = () => (
+    <div>
+      {!perms.rawEdit && <div className="text-slate-600">Недостаточно прав</div>}
+      {perms.rawEdit && (
+        <div className="space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="font-semibold">Пользователи</div>
+            <Button variant="outline" onClick={()=>{
+              const username = prompt('Логин нового пользователя','user1'); if(!username) return;
+              const role = prompt('Роль (admin/manager/master)','manager')||'manager';
+              const pwd = prompt('Пароль (не пустой)',''); if(!pwd) return;
+              (async()=>{ const salt = randomSalt(); const passHash = await sha256Hex(salt+pwd); setUsers([...(users||[]), { id: uid(), username, role, salt, passHash, active:true }]); showToast('Пользователь создан','success'); })();
+            }}>Добавить пользователя</Button>
+          </div>
+          <div className="overflow-auto">
+            <table className="min-w-full text-sm">
+              <thead><tr className="text-left text-slate-500"><th className="py-2">Логин</th><th>Роль</th><th>Статус</th><th className="text-right">Действия</th></tr></thead>
+              <tbody>
+                {(users||[]).map(u => (
+                  <tr key={u.id} className="border-t border-slate-100">
+                    <td className="py-2 font-medium">{u.username}</td>
+                    <td>
+                      <select value={u.role} onChange={e=>setUsers((users||[]).map(x=>x.id===u.id? { ...x, role:e.target.value }:x))} className="rounded-xl border border-slate-300 px-2 py-1">
+                        {['admin','manager','master'].map(r=> <option key={r} value={r}>{r}</option>)}
+                      </select>
+                    </td>
+                    <td>{u.active!==false? 'Активен':'Заблокирован'}</td>
+                    <td className="text-right flex items-center gap-2 justify-end">
+                      <Button variant="outline" onClick={()=>{ const pwd=prompt('Новый пароль',''); if(!pwd) return; (async()=>{ const salt=randomSalt(); const passHash=await sha256Hex(salt+pwd); setUsers((users||[]).map(x=>x.id===u.id? { ...x, salt, passHash }:x)); showToast('Пароль обновлён','success'); })(); }}>Пароль</Button>
+                      <Button variant="outline" onClick={()=> setUsers((users||[]).map(x=>x.id===u.id? { ...x, active: !(x.active!==false) }:x))}>{u.active!==false? 'Заблокировать':'Разблокировать'}</Button>
+                      <Button variant="danger" onClick={()=>{ if(confirm('Удалить пользователя?')) setUsers((users||[]).filter(x=>x.id!==u.id)); }}><Icon name="trash"/></Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
   return (
-    <Section title="Резервное копирование и настройки">
+    <Section title="Настройки" right={
+      <div className="flex items-center gap-2">
+        {['pricing','users','tech'].map(k => (
+          <button key={k} onClick={()=>setTab(k)} className={`px-3 py-1.5 rounded-xl text-sm font-semibold ${tab===k? 'bg-slate-900 text-white':'bg-white border border-slate-300 text-slate-700'}`}>{k==='pricing'?'Валюты/Наценки':k==='users'?'Пользователи':'Технические'}</button>
+        ))}
+      </div>
+    }>
       <div className="flex flex-col gap-4">
+        {tab==='pricing' && (
+          <>
+            <div className="flex flex-wrap items-end gap-3">
+              <div>
+                <div className="text-xs text-slate-500 mb-1">Текущая валюта отображения</div>
+                <select value={settings.currency} onChange={e=>setSettings({ ...settings, currency: e.target.value })} className="rounded-xl border border-slate-300 px-3 py-2">
+                  {codes.map(c=> <option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+              <div className="text-xs text-slate-500 ml-2">Версия схемы: v{SCHEMA_VERSION}</div>
+            </div>
+
+            <div className="bg-white rounded-2xl border border-slate-200 p-4">
+              <div className="flex items-center justify-between mb-3">
+                <div className="font-semibold">Курсы валют (KZT за 1 единицу)</div>
+                {perms.ratesEdit && <Button variant="outline" onClick={addCurrency}><Icon name="plus"/> Добавить валюту</Button>}
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {codes.map(code => (
+                  <div key={code} className="flex items-center gap-2">
+                    <div className="w-20 font-semibold">{code}</div>
+                    <input type="number" className="w-40 rounded-xl border border-slate-300 px-3 py-2" value={settings.rates[code]} onChange={e=>perms.ratesEdit && setRate(code, e.target.value)} disabled={!perms.ratesEdit} />
+                    {perms.ratesEdit && code!=='KZT' && <Button variant="danger" onClick={()=>removeCurrency(code)}><Icon name="trash"/></Button>}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="bg-white rounded-2xl border border-slate-200 p-4">
+              <div className="font-semibold mb-2">Наценка для золота (KZT, к базовой себестоимости)</div>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
+                {[
+                  ['Кольцо', 180000],
+                  ['Серьги', 300000],
+                  ['Подвеска', 200000],
+                  ['Пусеты', 225000],
+                ].map(([t, def]) => (
+                  <label key={t} className="block text-sm">
+                    <span className="block text-slate-600 mb-1">{t}</span>
+                    <input type="number" value={(settings.goldMarkupByType||{})[t]??def}
+                      onChange={e=> setSettings({ ...settings, goldMarkupByType: { ...(settings.goldMarkupByType||{}), [t]: +e.target.value } })}
+                      className="w-full rounded-xl border border-slate-300 px-3 py-2" />
+                  </label>
+                ))}
+              </div>
+              <div className="text-xs text-slate-500 mt-2">Применяется автоматически только для металла “Золото”. Для серебра используется базовая себестоимость (без наценки).</div>
+            </div>
+          </>
+        )}
         <div className="flex flex-wrap items-end gap-3">
           <div>
             <div className="text-xs text-slate-500 mb-1">Текущая валюта отображения</div>
@@ -3108,6 +3261,11 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings }) {
           <div className="text-xs text-slate-500 ml-2">Версия схемы: v{SCHEMA_VERSION}</div>
         </div>
 
+        {tab==='users' && (
+          <UsersTab />
+        )}
+
+        {tab==='tech' && (
         <div className="bg-white rounded-2xl border border-slate-200 p-4">
           <div className="flex items-center justify-between mb-3">
             <div className="font-semibold">Курсы валют (KZT за 1 единицу)</div>
@@ -3123,7 +3281,9 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings }) {
             ))}
           </div>
         </div>
+        )}
 
+        {tab==='tech' && (
         <div className="bg-white rounded-2xl border border-slate-200 p-4">
           <div className="font-semibold mb-2">Наценка для золота (KZT, к базовой себестоимости)</div>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
@@ -3143,6 +3303,7 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings }) {
           </div>
           <div className="text-xs text-slate-500 mt-2">Применяется автоматически только для металла “Золото”. Для серебра используется базовая себестоимость (без наценки).</div>
         </div>
+        )}
 
         <div className="flex flex-wrap items-center gap-3">
           <Button onClick={exportJSON}><Icon name="download"/> Экспортировать JSON</Button>
