@@ -49,6 +49,9 @@ const defaultSettings = {
   org: 'default',
   supabaseAuto: true,
   supabaseCloudFirst: false,
+  // Параметры мастера
+  allowSelfAssignMaster: true, // Разрешить мастеру брать задачу в работу
+  showPickListDiamondsOnly: true, // Пик-лист только бриллиантов
 };
 const ROLE_PERMS = {
   admin: { rawEdit:true, rawAdjust:true, modelEdit:true, fgAdjust:true, ordersCreate:true, payments:true, process:true, financeView:true, ratesEdit:true, reset:true, purchaseCreate:true, purchaseProcess:true },
@@ -240,6 +243,9 @@ function useStore() {
       bom: (m.bom||[]).map(b=> ({ rawItemId: b.rawItemId, qty: b.qty, wastePct: b.wastePct ?? 0 })),
       salesPrice: m.salesPrice ?? 0,
       salesCurrency: m.salesCurrency || 'KZT',
+      // сдельная ставка за изделие (админ настраивает)
+      pieceRate: m.pieceRate ?? 0,
+      pieceCurrency: m.pieceCurrency || (m.salesCurrency || 'KZT'),
       metalPricing: m.metalPricing || { 'Золото': 0, 'Серебро': 0 },
       platingCostSilver: m.platingCostSilver || 0,
       platingCurrencySilver: m.platingCurrencySilver || (m.salesCurrency || 'KZT'),
@@ -247,6 +253,16 @@ function useStore() {
       laborCurrency: m.laborCurrency || (m.salesCurrency || 'KZT'),
       allowedMetals: m.allowedMetals || Array.from(new Set([m.defaultMetal||'Золото', 'Серебро'])),
     })) );
+    // migrate orders: ensure master fields
+    setOrders(os => (os||[]).map(o => ({
+      ...o,
+      priority: o.priority || 'Обычный', // 'Низкий'|'Обычный'|'Высокий'|'Срочно'
+      deadline: o.deadline || null,
+      assignedTo: o.assignedTo || null,
+      masterStatus: o.masterStatus || null,
+      workStartedAt: o.workStartedAt || null,
+      workCompletedAt: o.workCompletedAt || null,
+    })));
     // move 'Работа' в услуги
     setServices(svcs => {
       const arr = Array.isArray(svcs) && svcs.length>0 ? svcs : seedServices();
@@ -463,6 +479,34 @@ class ErrorBoundary extends React.Component {
     }
     return this.props.children;
   }
+}
+
+// ------- Вид мастера: Главная -------
+function MasterHome({ orders, session }){
+  const me = session?.username || '';
+  const mine = (orders||[]).filter(o => o.assignedTo === me);
+  const today = new Date().toISOString().slice(0,10);
+  const doneToday = mine.filter(o => o.masterStatus==='Готово' && (o.workCompletedAt||'').slice(0,10)===today).reduce((s,o)=> s + (o.lines||[]).reduce((x,l)=>x+(l.qty||0),0), 0);
+  const doneWeek = mine.filter(o => {
+    if (!o.workCompletedAt) return false; const d = new Date(o.workCompletedAt); const now = new Date(); const diff = (now - d)/86400000; return diff<=7;
+  }).reduce((s,o)=> s + (o.lines||[]).reduce((x,l)=>x+(l.qty||0),0), 0);
+  const inWork = mine.filter(o => o.masterStatus==='В работе').length;
+  const onReview = mine.filter(o => o.masterStatus==='На проверке').length;
+  return (
+    <div>
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+        <StatCard title="В работе" value={inWork} sub="Мои задачи" />
+        <StatCard title="На проверке" value={onReview} sub="Ожидают приёмки" />
+        <StatCard title="Выполнено сегодня" value={doneToday} sub="шт" />
+        <StatCard title="Выполнено за неделю" value={doneWeek} sub="шт" />
+      </div>
+      <Section title="Быстрый доступ">
+        <div className="flex gap-2">
+          <a className="px-3 py-2 rounded-xl bg-slate-900 text-white font-semibold" href="#" onClick={(e)=>{e.preventDefault(); const ev=new Event('click'); document.querySelector('aside button:nth-child(2)')?.dispatchEvent(ev); }}>Перейти в Мои задачи →</a>
+        </div>
+      </Section>
+    </div>
+  );
 }
 
 // ------- Логика себестоимости -------
@@ -693,22 +737,37 @@ function NeoDiamondWMS() {
     return { rawValue, fgCount, openOrders, todayIn, lowROP, lowSS };
   }, [rawItems, jewelryStock, orders, ledger, settings, models]);
 
-  const nav = [
-    { id:'home', label:'Главная', icon:'home' },
-    { id:'catalog', label:'Каталог', icon:'box' },
-    { id:'warehouse', label:'Склад', icon:'warehouse', subs:[{id:'raw',label:'Сырьё'},{id:'services',label:'Услуги'},{id:'fg',label:'Украшения'}]},
-    { id:'orders', label:'Заказы', icon:'play' },
-    { id:'purchases', label:'Закупки', icon:'cart', subs:[{id:'suppliers',label:'Поставщики'},{id:'po',label:'Заказы поставщикам'}]},
-    { id:'finance', label:'Финансы', icon:'money' },
-    { id:'analytics', label:'Аналитика', icon:'analytics', subs:[{id:'cost',label:'Себестоимость'},{id:'revenue',label:'Выручка по дням'},{id:'abcxyz',label:'ABC/XYZ'},{id:'margin',label:'Маржа по моделям'},{id:'stockdays',label:'Дни запаса (сырьё)'},{id:'stockdaysModels',label:'Дни запаса (модели)'}]},
-    { id:'planning', label:'Планирование', icon:'calendar', subs:[{id:'capacity',label:'Производство'},{id:'reorder',label:'Рекомендации закупок'}]},
-    { id:'settings', label:'Настройки', icon:'gear' },
-  ];
+  const nav = React.useMemo(()=>{
+    if ((settings.role||'manager') === 'master') {
+      return [
+        { id:'home', label:'Главная', icon:'home' },
+        { id:'m_orders', label:'Мои задачи', icon:'play' },
+        { id:'earnings', label:'Мои начисления', icon:'money' },
+        { id:'profile', label:'Профиль', icon:'gear' },
+      ];
+    }
+    return [
+      { id:'home', label:'Главная', icon:'home' },
+      { id:'catalog', label:'Каталог', icon:'box' },
+      { id:'warehouse', label:'Склад', icon:'warehouse', subs:[{id:'raw',label:'Сырьё'},{id:'services',label:'Услуги'},{id:'fg',label:'Украшения'}]},
+      { id:'orders', label:'Заказы', icon:'play' },
+      { id:'purchases', label:'Закупки', icon:'cart', subs:[{id:'suppliers',label:'Поставщики'},{id:'po',label:'Заказы поставщикам'}]},
+      { id:'finance', label:'Финансы', icon:'money' },
+      { id:'analytics', label:'Аналитика', icon:'analytics', subs:[{id:'cost',label:'Себестоимость'},{id:'revenue',label:'Выручка по дням'},{id:'abcxyz',label:'ABC/XYZ'},{id:'margin',label:'Маржа по моделям'},{id:'stockdays',label:'Дни запаса (сырьё)'},{id:'stockdaysModels',label:'Дни запаса (модели)'}]},
+      { id:'planning', label:'Планирование', icon:'calendar', subs:[{id:'capacity',label:'Производство'},{id:'reorder',label:'Рекомендации закупок'}]},
+      { id:'settings', label:'Настройки', icon:'gear' },
+    ];
+  }, [settings.role]);
 
   const renderContent = () => {
     if (!isLogged) return <LoginScreen users={users} onCreateAdmin={(u)=>{ setUsers([u]); setSession({ username:u.username, role:u.role }); setSettings({ ...settings, role:u.role }); showToast('Администратор создан','success'); }} onLogin={(s)=>{ setSession(s); setSettings({ ...settings, role:s.role }); showToast('Вход выполнен','success'); }} onSetPassword={({id,salt,passHash})=> setUsers((users||[]).map(x=>x.id===id? { ...x, salt, passHash }:x))} />;
-    if (section==='home') return <Dashboard metrics={metrics} rawItems={rawItems} jewelryStock={jewelryStock} orders={orders} ledger={ledger} models={models} settings={settings} setSection={setSection} />;
+    if (section==='home') {
+      if ((settings.role||'manager')==='master') return <MasterHome orders={orders} session={session} />;
+      return <Dashboard metrics={metrics} rawItems={rawItems} jewelryStock={jewelryStock} orders={orders} ledger={ledger} models={models} settings={settings} setSection={setSection} />;
+    }
+    if (section==='m_orders') return <MasterBoard store={store} session={session} />;
     if (section==='orders') return <OrdersBoard store={store} />;
+    if (section==='earnings') return <MasterEarnings orders={orders} models={models} session={session} settings={settings} />;
     if (section==='catalog') {
       return <ModelsBOM models={models} setModels={setModels} rawItems={rawItems} settings={settings} />;
     }
@@ -739,6 +798,7 @@ function NeoDiamondWMS() {
       if (s==='reorder') return <Section title="Рекомендации закупок"><ReorderRecommendations settings={settings} /></Section>;
     }
     if (section==='settings') return <Backup exportJSON={exportJSON} importJSON={importJSON} resetAll={resetAll} settings={settings} setSettings={setSettings} users={users} setUsers={setUsers} />;
+    if (section==='profile') return <Profile users={users} setUsers={setUsers} session={session} onLogout={()=>{ setSession(null); setSettings({ ...settings, role:'manager' }); }} />;
     return null;
   };
 
@@ -866,6 +926,52 @@ function LoginScreen({ users, onCreateAdmin, onLogin, onSetPassword }){
         </div>
         <div className="text-xs text-slate-500 mt-3">Пароли хранятся как SHA‑256(соль+пароль). Для первого входа можно создать логин без пароля и установить его здесь.</div>
       </div>
+    </div>
+  );
+}
+
+function Profile({ users, setUsers, session, onLogout }){
+  const me = users?.find?.(u=> u.username === (session?.username||''));
+  const [p1, setP1] = React.useState('');
+  const [p2, setP2] = React.useState('');
+  const [msg, setMsg] = React.useState('');
+  const save = async ()=>{
+    try{
+      setMsg('');
+      if (!p1 || !p2) { setMsg('Введите новый пароль дважды'); return; }
+      if (p1!==p2) { setMsg('Пароли не совпадают'); return; }
+      if (!me) { setMsg('Пользователь не найден'); return; }
+      const salt = randomSalt();
+      const passHash = await sha256Hex(salt + p1);
+      setUsers((users||[]).map(x=> x.id===me.id? { ...x, salt, passHash } : x));
+      setP1(''); setP2('');
+      showToast('Пароль обновлён','success');
+    }catch(e){ setMsg('Ошибка сохранения'); }
+  };
+  return (
+    <div className="max-w-lg">
+      <Section title="Профиль">
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <div className="text-slate-500 text-sm">Логин</div>
+            <div className="font-semibold">{session?.username||'—'}</div>
+          </div>
+          <div>
+            <div className="text-slate-500 text-sm">Роль</div>
+            <div className="font-semibold">{me?.role||'master'}</div>
+          </div>
+        </div>
+        <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3">
+          <Input label="Новый пароль" type="password" value={p1} onChange={e=>setP1(e.target.value)} />
+          <Input label="Повторите пароль" type="password" value={p2} onChange={e=>setP2(e.target.value)} />
+        </div>
+        {msg && <div className="text-sm text-red-600 mt-2">{msg}</div>}
+        <div className="flex items-center gap-2 mt-3">
+          <Button onClick={save}><Icon name="check"/> Сохранить</Button>
+          <Button variant="outline" onClick={onLogout}>Выйти</Button>
+        </div>
+        <div className="text-xs text-slate-500 mt-3">Доступ к настройкам, складу и финансам ограничен для роли master.</div>
+      </Section>
     </div>
   );
 }
@@ -1004,6 +1110,90 @@ function ReorderRecommendations({ settings }) {
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+// ------- Вид мастера: Канбан -------
+function MasterBoard({ store, session }){
+  const { orders, setOrders, models, settings } = store;
+  const me = session?.username || '';
+  const allowSelf = !!(settings?.allowSelfAssignMaster);
+  const [q, setQ] = React.useState('');
+
+  const setOrderPatch = (id, patch) => setOrders((os)=> os.map(o => o.id===id? { ...o, ...patch } : o));
+  const takeInWork = (o) => {
+    if (!allowSelf) return;
+    if (o.assignedTo && o.assignedTo!==me) return;
+    const now = new Date().toISOString();
+    setOrderPatch(o.id, { assignedTo: me, masterStatus: 'В работе', workStartedAt: (o.workStartedAt||now) });
+  };
+  const setStatus = (o, status) => {
+    const patch = { masterStatus: status };
+    if (status==='Готово') patch.workCompletedAt = new Date().toISOString();
+    setOrderPatch(o.id, patch);
+  };
+  const prioBadge = (p) => {
+    const map = { 'Низкий':'gray', 'Обычный':'blue', 'Высокий':'yellow', 'Срочно':'red' };
+    return <Badge color={map[p]||'blue'}>{p||'Обычный'}</Badge>;
+  };
+  const deadBadge = (d) => {
+    if (!d) return null; const dd = new Date(d); const days = Math.ceil((dd - Date.now())/86400000);
+    const color = days<0? 'red' : days<=1? 'yellow' : 'green';
+    return <Badge color={color}>{dd.toLocaleDateString('ru-RU')}</Badge>;
+  };
+  const myOrders = orders.filter(o => o.assignedTo===me && (!q || (o.id||'').includes(q)));
+  const unassigned = orders.filter(o => !o.assignedTo && allowSelf && (!q || (o.id||'').includes(q)));
+  const groups = {
+    'Неназначено': unassigned,
+    'В работе': myOrders.filter(o => (o.masterStatus||'')==='В работе'),
+    'На проверке': myOrders.filter(o => (o.masterStatus||'')==='На проверке'),
+    'Готово': myOrders.filter(o => (o.masterStatus||'')==='Готово'),
+  };
+  const columns = allowSelf? ['Неназначено','В работе','На проверке','Готово'] : ['В работе','На проверке','Готово'];
+  const card = (o) => {
+    const first = (o.lines||[])[0];
+    const m = models.find(mm=>mm.id===first?.modelId);
+    return (
+      <div key={o.id} className="rounded-xl border border-slate-200 p-3 bg-white ani-pop">
+        <div className="flex items-center justify-between">
+          <div className="text-xs text-slate-500">ID: {(o.id||'').slice(-6)}</div>
+          <div className="flex items-center gap-2">{prioBadge(o.priority)}{deadBadge(o.deadline)}</div>
+        </div>
+        <div className="mt-1 font-semibold">{m?.name||'Модель'}</div>
+        <div className="text-sm text-slate-600">{first?.metal||m?.defaultMetal} · {first?.color||m?.defaultColor} · {first?.qty||1} шт</div>
+        {o.note && <div className="text-xs text-slate-500 mt-1 whitespace-pre-wrap">{o.note}</div>}
+        <div className="flex items-center gap-2 mt-2">
+          {!o.assignedTo && allowSelf && <Button onClick={()=>takeInWork(o)}><Icon name="check"/> Взять в работу</Button>}
+          {o.assignedTo===me && (o.masterStatus!=='В работе') && <Button variant="outline" onClick={()=>setStatus(o,'В работе')}>В работу</Button>}
+          {o.assignedTo===me && (o.masterStatus==='В работе') && <Button variant="outline" onClick={()=>setStatus(o,'На проверке')}>На проверке</Button>}
+          {o.assignedTo===me && (o.masterStatus==='На проверке') && <Button variant="success" onClick={()=>setStatus(o,'Готово')}>Готово</Button>}
+        </div>
+      </div>
+    );
+  };
+  return (
+    <div>
+      <div className="flex flex-col md:flex-row md:items-center gap-3 mb-4">
+        <div className="relative">
+          <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Поиск по ID" className="w-72 rounded-xl border border-slate-300 pl-9 pr-3 py-2"/>
+          <span className="absolute left-2.5 top-2.5 text-slate-400"><Icon name="search"/></span>
+        </div>
+        <div className="md:ml-auto text-sm text-slate-600">Вид только для мастера: без цен и оплат.</div>
+      </div>
+      <div className="flex gap-4 overflow-auto pb-2">
+        {columns.map(st => (
+          <div key={st} className="min-w-[320px] bg-white rounded-2xl border border-slate-200 p-3">
+            <div className="flex items-center justify-between mb-2">
+              <div className="font-bold">{st}</div>
+              <Badge color={st==='Готово'? 'green': st==='На проверке'? 'blue': st==='В работе'? 'yellow':'gray'}>{(groups[st]||[]).length}</Badge>
+            </div>
+            <div className="space-y-3">
+              {(groups[st]||[]).map(card)}
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -1150,6 +1340,90 @@ function PopularModels({ models, orders, ledger, settings, range, onRangeChange,
 }
 
 // ------- Заказы + Канбан -------
+function MasterEarnings({ orders, models, session, settings }){
+  const me = session?.username || '';
+  const [from, setFrom] = React.useState(()=> new Date(Date.now()-6*86400000).toISOString().slice(0,10));
+  const [to, setTo] = React.useState(()=> new Date().toISOString().slice(0,10));
+  const pieceRate = (mid) => {
+    const m = models.find(x=>x.id===mid);
+    const rate = +((m?.pieceRate)||0);
+    const cur = (m?.pieceCurrency)||'KZT';
+    return convert(rate, cur, settings.currency, settings.rates);
+  };
+  const inRange = (iso) => { if(!iso) return false; const d=iso.slice(0,10); return (!from || d>=from) && (!to || d<=to); };
+  const mineDone = (orders||[]).filter(o => o.assignedTo===me && o.masterStatus==='Готово' && inRange(o.workCompletedAt||''));
+  const lines = [];
+  mineDone.forEach(o => (o.lines||[]).forEach(l => lines.push({ mid:l.modelId, qty:l.qty||1, completedAt:o.workCompletedAt }))); 
+  const byModel = lines.reduce((acc, l)=>{ const r=acc[l.mid]||{qty:0, amount:0}; r.qty+=l.qty; r.amount+= l.qty*pieceRate(l.mid); acc[l.mid]=r; return acc; }, {});
+  const rows = Object.keys(byModel).map(mid=>({ id: mid, name: (models.find(m=>m.id===mid)?.name)||'Модель', qty: byModel[mid].qty, amount: byModel[mid].amount })).sort((a,b)=> b.amount-a.amount);
+  const total = rows.reduce((s,r)=>s+r.amount,0);
+  const doneToday = mineDone.filter(o => (o.workCompletedAt||'').slice(0,10)===new Date().toISOString().slice(0,10)).reduce((s,o)=> s + (o.lines||[]).reduce((x,l)=>x+(l.qty||0),0), 0);
+
+  // Expenses (металлы) — ручной учёт по пользователю
+  const key = `nd_master_expenses_${me}`;
+  const [expenses, setExpenses] = React.useState(()=> loadLS(key, []));
+  React.useEffect(()=> saveLS(key, expenses), [expenses, key]);
+  const [exDate, setExDate] = React.useState(()=> new Date().toISOString().slice(0,10));
+  const [exAmt, setExAmt] = React.useState(0);
+  const [exNote, setExNote] = React.useState('Металл');
+  const addExpense = ()=>{ if(!exDate || !exAmt) return; setExpenses([{ id: uid(), date: exDate, amount: +exAmt, note: exNote }, ...expenses]); setExAmt(0); };
+  const expRange = expenses.filter(e => (!from || e.date>=from) && (!to || e.date<=to));
+  const expTotal = expRange.reduce((s,e)=> s + convert(e.amount||0, 'KZT', settings.currency, settings.rates), 0);
+
+  const exportCSV = ()=>{
+    const header = ['Модель','Кол-во','Начислено'];
+    const lines = rows.map(r=> [r.name, r.qty, moneyFmt(r.amount, settings.currency)].join(','));
+    const blob = new Blob([[header.join(',')].concat(lines).join('\n')], { type:'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=`earnings-${from}_to_${to}.csv`; a.click(); URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div>
+      <div className="flex flex-col md:flex-row md:items-end gap-3 mb-4">
+        <Input label="С даты" type="date" value={from} onChange={e=>setFrom(e.target.value)} />
+        <Input label="По дату" type="date" value={to} onChange={e=>setTo(e.target.value)} />
+        <div className="ml-auto flex items-center gap-2">
+          <Badge color="green">Выполнено сегодня: {fmt.format(doneToday)} шт</Badge>
+          <Button variant="outline" onClick={exportCSV}><Icon name="download"/> Экспорт CSV</Button>
+        </div>
+      </div>
+
+      <Section title="Мои начисления" right={<div className="text-slate-600">Итого: <b>{moneyFmt(total, settings.currency)}</b></div>}>
+        <div className="overflow-auto">
+          <table className="min-w-full text-sm">
+            <thead><tr className="text-left text-slate-500"><th className="py-2">Модель</th><th className="text-right">Кол-во</th><th className="text-right">Начислено</th></tr></thead>
+            <tbody>
+              {rows.map(r=> (
+                <tr key={r.id} className="border-t border-slate-100"><td className="py-2 font-medium">{r.name}</td><td className="text-right">{fmt.format(r.qty)}</td><td className="text-right">{moneyFmt(r.amount, settings.currency)}</td></tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Section>
+
+      <Section title="Мои расходы на металлы" right={<div className="text-slate-600">Итого: <b>{moneyFmt(expTotal, settings.currency)}</b></div>}>
+        <div className="grid grid-cols-1 md:grid-cols-6 gap-2 mb-3">
+          <Input label="Дата" type="date" value={exDate} onChange={e=>setExDate(e.target.value)} />
+          <Input label={`Сумма (${settings.currency})`} type="number" value={exAmt} onChange={e=>setExAmt(+e.target.value)} />
+          <Input label="Примечание" value={exNote} onChange={e=>setExNote(e.target.value)} />
+          <div className="md:col-span-2"></div>
+          <div className="flex items-end"><Button onClick={addExpense}><Icon name="plus"/> Добавить</Button></div>
+        </div>
+        <div className="overflow-auto">
+          <table className="min-w-full text-sm">
+            <thead><tr className="text-left text-slate-500"><th className="py-2">Дата</th><th>Примечание</th><th className="text-right">Сумма</th><th className="text-right">Действия</th></tr></thead>
+            <tbody>
+              {expRange.map(e=> (
+                <tr key={e.id} className="border-t border-slate-100"><td className="py-2">{e.date}</td><td>{e.note||''}</td><td className="text-right">{moneyFmt(convert(e.amount||0,'KZT',settings.currency,settings.rates), settings.currency)}</td><td className="text-right"><Button variant="ghost" onClick={()=> setExpenses(expenses.filter(x=>x.id!==e.id))}><Icon name="trash"/></Button></td></tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Section>
+    </div>
+  );
+}
+
 function OrdersBoard({ store }) {
   const { rawItems, setRawItems, models, jewelryStock, setJewelryStock, orders, setOrders, ledger, setLedger, settings } = store;
   const [showNew, setShowNew] = useState(false);
@@ -1282,9 +1556,14 @@ function OrderCard({ order, models, settings, canPay, canProcess, onMoveLeft, on
           <span>{new Date(order.createdAt).toLocaleDateString('ru-RU')}</span>
           <span className="inline-block px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-xs">{daysSince} дн.</span>
         </div>
-        <Badge color={order.type==='Клиентский'? 'violet':'gray'}>{order.type}</Badge>
+        <div className="flex items-center gap-2">
+          {order.deadline && <Badge color="yellow">До {new Date(order.deadline).toLocaleDateString('ru-RU')}</Badge>}
+          {order.priority && <Badge color={order.priority==='Срочно'? 'red' : order.priority==='Высокий'? 'yellow' : 'gray'}>{order.priority}</Badge>}
+          <Badge color={order.type==='Клиентский'? 'violet':'gray'}>{order.type}</Badge>
+        </div>
       </div>
       <div className="font-semibold text-slate-900 mt-1">{order.customer||'—'}</div>
+      {order.assignedTo && <div className="text-xs text-slate-500">Назначено: {order.assignedTo}</div>}
       <div className="mt-2 text-sm">
         {order.lines.slice(0,1).map(l=> {
           const m = models.find(mm=>mm.id===l.modelId);
@@ -1380,6 +1659,8 @@ function NewOrderModal({ models, services, settings, onClose, onCreate }) {
   const [produceFromRaw, setProduceFromRaw] = useState(true);
   const [lines, setLines] = useState([]);
   const [note, setNote] = useState("");
+  const [priority, setPriority] = useState('Обычный');
+  const [deadline, setDeadline] = useState('');
 
   const addLine = () => {
     const m = models[0];
@@ -1430,6 +1711,8 @@ function NewOrderModal({ models, services, settings, onClose, onCreate }) {
               <option value="0">Нет — отгрузить со склада украшений</option>
             </select>
           </label>
+          <Select label="Приоритет" value={priority} onChange={setPriority} options={["Низкий","Обычный","Высокий","Срочно"]} />
+          <Input label="Дедлайн" type="date" value={deadline} onChange={e=>setDeadline(e.target.value)} />
         </div>
         <label className="block text-sm mb-3">
           <span className="block text-slate-600 mb-1">Комментарий к заказу</span>
@@ -1517,7 +1800,7 @@ function NewOrderModal({ models, services, settings, onClose, onCreate }) {
           <Button onClick={()=>{
             if (lines.length===0) { alert('Добавьте хотя бы одну позицию'); return; }
             if (lines.some(l => !l.color)) { alert('Укажите цвет для всех позиций заказа'); return; }
-            const newOrder = { type, customer: customer||undefined, lines, produceFromRaw, note };
+            const newOrder = { type, customer: customer||undefined, lines, produceFromRaw, note, priority, deadline: deadline||null };
             onCreate(newOrder);
           }}><Icon name="check"/> Создать</Button>
         </div>
@@ -2598,6 +2881,8 @@ function NewModelModal({ rawItems, settings, onClose, onCreate }) {
   const [defaultColor, setDefaultColor] = useState("Белый");
   const [salesCurrency, setSalesCurrency] = useState('KZT');
   const [salesPrice, setSalesPrice] = useState(0);
+  const [pieceCurrency, setPieceCurrency] = useState('KZT');
+  const [pieceRate, setPieceRate] = useState(0);
   const [laborCurrency, setLaborCurrency] = useState('KZT');
   const [laborCost, setLaborCost] = useState(0);
   const [allowedMetals, setAllowedMetals] = useState(['Золото','Серебро']);
@@ -2617,6 +2902,8 @@ function NewModelModal({ rawItems, settings, onClose, onCreate }) {
           <Input label="Цена продажи (за шт)" type="number" value={salesPrice} onChange={e=>setSalesPrice(+e.target.value)} />
           <Select label="Валюта работы (по умолч.)" value={laborCurrency} onChange={setLaborCurrency} options={Object.keys(defaultSettings.rates||{KZT:1})} />
           <Input label="Работа цеха (за шт, по умолч.)" type="number" value={laborCost} onChange={e=>setLaborCost(+e.target.value)} />
+          <Select label="Валюта сдельной ставки" value={pieceCurrency} onChange={setPieceCurrency} options={Object.keys(defaultSettings.rates||{KZT:1})} />
+          <Input label="Сдельная ставка (за изделие)" type="number" value={pieceRate} onChange={e=>setPieceRate(+e.target.value)} />
         </div>
         <div className="mb-3">
           <div className="text-sm text-slate-600 mb-1">Вариации (металл) по умолчанию</div>
@@ -2687,7 +2974,7 @@ function NewModelModal({ rawItems, settings, onClose, onCreate }) {
             const ts = new Date().toISOString();
             const defaultMetal = variants[0]?.metal || 'Золото';
             const photoUrl = photosByColor[defaultColor] || photosByColor['Белый'] || null;
-            onCreate({ id: uid(), name, type, defaultMetal, defaultColor, salesPrice, salesCurrency, laborCurrency, laborCost, allowedMetals: Array.from(new Set(allowedMetals)), bom, variants, photosByColor, photoUrl, createdAt: ts, updatedAt: ts, archived:false });
+            onCreate({ id: uid(), name, type, defaultMetal, defaultColor, salesPrice, salesCurrency, pieceRate, pieceCurrency, laborCurrency, laborCost, allowedMetals: Array.from(new Set(allowedMetals)), bom, variants, photosByColor, photoUrl, createdAt: ts, updatedAt: ts, archived:false });
           }}><Icon name="check"/> Создать</Button>
         </div>
       </div>
@@ -2757,6 +3044,8 @@ function EditModelModal({ model, rawItems, settings, onClose, onSave, onUploadPh
             <Select label="Цвет по умолч." value={local.defaultColor||'Белый'} onChange={v=>upd({ defaultColor:v })} options={["Белый","Жёлтый","Красный"]} />
             <Select label="Валюта продажи" value={local.salesCurrency||'KZT'} onChange={v=>upd({ salesCurrency:v })} options={Object.keys(settings.rates)} />
             <Input label={`Цена продажи (за шт)`} type="number" value={local.salesPrice||0} onChange={e=>upd({ salesPrice:+e.target.value })} />
+            <Select label="Валюта сдельной ставки" value={local.pieceCurrency||'KZT'} onChange={v=>upd({ pieceCurrency:v })} options={Object.keys(settings.rates)} />
+            <Input label={`Сдельная ставка (за изделие)`} type="number" value={local.pieceRate||0} onChange={e=>upd({ pieceRate:+e.target.value })} />
             <label className="inline-flex items-center gap-2 text-sm">
               <input type="checkbox" checked={!!local.archived} onChange={e=>upd({ archived:e.target.checked })} />
               <span>Скрывать в каталоге</span>
