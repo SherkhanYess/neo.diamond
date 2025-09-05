@@ -48,6 +48,7 @@ const defaultSettings = {
   supabaseBucket: 'photos',
   org: 'default',
   supabaseAuto: true,
+  supabaseCloudFirst: false,
 };
 const ROLE_PERMS = {
   admin: { rawEdit:true, rawAdjust:true, modelEdit:true, fgAdjust:true, ordersCreate:true, payments:true, process:true, financeView:true, ratesEdit:true, reset:true, purchaseCreate:true, purchaseProcess:true },
@@ -264,6 +265,33 @@ function useStore() {
   useEffect(() => saveLS("nd_orders", orders), [orders]);
   useEffect(() => saveLS("nd_ledger", ledger), [ledger]);
   useEffect(() => saveLS("nd_settings", settings), [settings]);
+
+  // Cloud-first загрузка при старте
+  const cloudLoadedRef = React.useRef(false);
+  useEffect(() => {
+    (async () => {
+      if (cloudLoadedRef.current) return;
+      if (!settings?.supabaseCloudFirst) return;
+      try {
+        const client = getSupabaseClient(settings);
+        if (!client) return;
+        const { data, error } = await client.from('nd_state').select('blob, updated_at').eq('org', settings.org||'default').single();
+        if (error || !data?.blob) return;
+        const b = data.blob;
+        setRawItems(Array.isArray(b.rawItems)? b.rawItems : []);
+        setModels(Array.isArray(b.models)? b.models : []);
+        setJewelryStock(Array.isArray(b.jewelryStock)? b.jewelryStock : []);
+        setOrders(Array.isArray(b.orders)? b.orders : []);
+        setLedger(Array.isArray(b.ledger)? b.ledger : []);
+        setSuppliers(Array.isArray(b.suppliers)? b.suppliers : []);
+        setServices(Array.isArray(b.services)? b.services : services);
+        setPOs(Array.isArray(b.pos)? b.pos : []);
+        setSettings({ ...settings, ...(b.settings||{}) });
+        cloudLoadedRef.current = true;
+        showToast('Загружено из облака при старте', 'success');
+      } catch (e) { console.warn('cloud-first load failed', e); }
+    })();
+  }, [settings.supabaseUrl, settings.supabaseAnon, settings.org, settings.supabaseCloudFirst]);
 
   // Автосинхронизация в Supabase (если включена)
   const autoCloudSave = React.useMemo(()=> debounce(async (payload)=>{
@@ -3138,6 +3166,10 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings }) {
             <input type="checkbox" checked={!!settings.supabaseAuto} onChange={e=>setSettings({ ...settings, supabaseAuto: e.target.checked })} />
             <span>Автосинхронизация изменений в облако</span>
           </label>
+          <label className="inline-flex items-center gap-2 mt-1 text-sm">
+            <input type="checkbox" checked={!!settings.supabaseCloudFirst} onChange={e=>setSettings({ ...settings, supabaseCloudFirst: e.target.checked })} />
+            <span>Загружать данные из облака при старте</span>
+          </label>
           <div className="flex items-center gap-2 mt-2">
             <Button variant="outline" onClick={async()=>{
               try {
@@ -3179,6 +3211,38 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings }) {
                 showToast('Загружено из облака ('+ new Date(data.updated_at).toLocaleString('ru-RU') +')', 'success');
               } catch (e) { console.error(e); showToast('Ошибка загрузки: ' + (e.message||e), 'danger'); }
             }}>Загрузить из облака</Button>
+            <Button variant="outline" onClick={async()=>{
+              try {
+                const client = getSupabaseClient(settings);
+                if (!client) { showToast('Заполните Supabase URL и anon key', 'warn'); return; }
+                const models = loadLS('nd_models', []);
+                const updated = [];
+                const needUpload = (v)=> typeof v === 'string' && v.startsWith('data:image');
+                for (const m of models) {
+                  const mm = { ...m };
+                  if (needUpload(mm.photoUrl)) {
+                    const p = `models/${mm.id}/main-${Date.now()}.jpg`;
+                    const url = await supabaseUploadImage(mm.photoUrl, settings, p); if (url) mm.photoUrl=url;
+                  }
+                  if (mm.photosByColor) {
+                    const obj = { ...mm.photosByColor };
+                    for (const c of Object.keys(obj)) if (needUpload(obj[c])) { const p=`models/${mm.id}/colors/${c}-${Date.now()}.jpg`; const url=await supabaseUploadImage(obj[c], settings, p); if (url) obj[c]=url; }
+                    mm.photosByColor = obj;
+                  }
+                  mm.variants = await Promise.all((mm.variants||[]).map(async (v)=>{
+                    const vv={...v};
+                    if (needUpload(vv.photoUrl)) { const p=`models/${mm.id}/variants/${vv.id}/main-${Date.now()}.jpg`; const url=await supabaseUploadImage(vv.photoUrl, settings, p); if (url) vv.photoUrl=url; }
+                    if (vv.photosByColor) {
+                      for (const c of Object.keys(vv.photosByColor)) if (needUpload(vv.photosByColor[c])) { const p=`models/${mm.id}/variants/${vv.id}/color-${c}-${Date.now()}.jpg`; const url=await supabaseUploadImage(vv.photosByColor[c], settings, p); if (url) vv.photosByColor[c]=url; }
+                    }
+                    return vv;
+                  }));
+                  updated.push(mm);
+                }
+                saveLS('nd_models', updated);
+                showToast('Фото перенесены в облако и ссылки обновлены', 'success');
+              } catch (e) { console.error(e); showToast('Ошибка миграции фото: ' + (e.message||e), 'danger'); }
+            }}>Миграция фото в облако</Button>
           </div>
           <div className="text-xs text-slate-500 mt-2">Подробности и SQL для таблиц см. в README.md (раздел Supabase).</div>
         </div>
