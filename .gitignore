@@ -1,0 +1,6 @@
+# Ignore local keys and temp files
+.ssh_deploy_key
+.ssh_deploy_key.pub
+diag/
+node_modules/
+.DS_Store

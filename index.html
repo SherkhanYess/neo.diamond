@@ -1,0 +1,3136 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Neo Diamond — Онлайн-склад (MVP)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://unpkg.com/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+  <style>
+    @keyframes fadeInUp { from { opacity: 0; transform: translateY(6px) } to { opacity: 1; transform: translateY(0) } }
+    @keyframes popIn { from { opacity:0; transform: scale(.98) } to { opacity:1; transform: scale(1) } }
+    .ani-fade-in { animation: fadeInUp .35s ease-out both }
+    .ani-pop { animation: popIn .18s ease-out both }
+    .ripple { position: absolute; border-radius: 9999px; transform: scale(0); animation: ripple .6s linear; background: rgba(99,102,241,.25); pointer-events:none }
+    @keyframes ripple { to { transform: scale(4); opacity: 0; } }
+  </style>
+</head>
+<body class="bg-slate-50 text-[13px] md:text-[14px]">
+  <div id="app"></div>
+  <script type="text/babel" data-presets="env,react" data-plugins="proposal-class-properties,proposal-nullish-coalescing-operator,proposal-optional-chaining">
+  const { useEffect, useMemo, useState } = React;
+
+// =========================
+// Neo Diamond — Онлайн-склад (MVP)
+// Двухскладская модель: Склад сырья и Склад украшений
+// Модели (BOM), Заказы (Собственные/Клиентские), Канбан, Финансы, Отчёты
+// Хранение в localStorage, экспорт/импорт JSON
+// =========================
+
+// ------- Утилиты -------
+const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+const fmt = new Intl.NumberFormat("ru-RU");
+const KZT = new Intl.NumberFormat("ru-RU", { style: "currency", currency: "KZT", maximumFractionDigits: 0 });
+// Мультивалюта: настройки по умолчанию и утилиты
+const defaultSettings = {
+  baseCurrency: 'KZT',
+  currency: 'KZT',
+  rates: { KZT: 1, USD: 475, EUR: 510, RUB: 5, CNY: 65 }, // курс: сколько KZT за 1 единицу валюты
+  role: 'admin', // admin | manager | master
+  goldMarkupByType: { 'Кольцо': 180000, 'Серьги': 300000, 'Подвеска': 200000, 'Пусеты': 225000 }, // в KZT
+  // Облако (Supabase)
+  supabaseUrl: '',
+  supabaseAnon: '',
+  supabaseBucket: 'photos',
+  org: 'default',
+};
+const ROLE_PERMS = {
+  admin: { rawEdit:true, rawAdjust:true, modelEdit:true, fgAdjust:true, ordersCreate:true, payments:true, process:true, financeView:true, ratesEdit:true, reset:true, purchaseCreate:true, purchaseProcess:true },
+  manager: { rawEdit:false, rawAdjust:false, modelEdit:false, fgAdjust:false, ordersCreate:true, payments:true, process:false, financeView:true, ratesEdit:false, reset:false, purchaseCreate:true, purchaseProcess:true },
+  master: { rawEdit:false, rawAdjust:false, modelEdit:false, fgAdjust:true, ordersCreate:false, payments:false, process:true, financeView:false, ratesEdit:false, reset:false, purchaseCreate:false, purchaseProcess:false },
+};
+const convert = (amount, from, to, rates) => {
+  const amt = +amount || 0;
+  const rFrom = rates?.[from] ?? 1; // KZT per FROM
+  const rTo = rates?.[to] ?? 1;     // KZT per TO
+  const inKZT = amt * rFrom;
+  return to === 'KZT' ? inKZT : inKZT / rTo;
+};
+// Цена услуги по названию (по отображаемой валюте)
+const servicePrice = (name, settings=defaultSettings) => {
+  try {
+    const list = loadLS('nd_services', []);
+    const s = (list||[]).find(x => (x.name||'').toLowerCase().includes(String(name||'').toLowerCase()));
+    return s ? convert(s.price||0, s.currency||'KZT', settings.currency, settings.rates) : 0;
+  } catch { return 0; }
+};
+const moneyFmt = (amount, currency='KZT') => new Intl.NumberFormat('ru-RU', { style:'currency', currency, maximumFractionDigits: 0 }).format(+amount||0);
+const moneyDisplay = (amount, fromCurrency='KZT', settings=defaultSettings) => moneyFmt(convert(amount, fromCurrency, settings.currency, settings.rates), settings.currency);
+
+// Услуги (работы): отдельная сущность
+const seedServices = () => ([
+  { id: uid(), name: 'Работа цеха', price: 10000, currency: 'KZT' },
+  { id: uid(), name: 'Гравировка', price: 5000, currency: 'KZT' },
+  { id: uid(), name: 'Изменение размера', price: 8000, currency: 'KZT' },
+  { id: uid(), name: 'Восстановление покрытия', price: 7000, currency: 'KZT' },
+]);
+
+// Toasts
+const showToast = (text, type='info') => window.dispatchEvent(new CustomEvent('nd:toast', { detail: { id: uid(), text, type } }));
+
+// Помощники для изображений: сжатие и ограничение размера
+async function readFileAsDataURL(file) {
+  return new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(fr.result);
+    fr.onerror = rej;
+    fr.readAsDataURL(file);
+  });
+}
+async function loadImage(src) {
+  return new Promise((res, rej) => { const img = new Image(); img.onload = ()=>res(img); img.onerror = rej; img.src = src; });
+}
+async function compressImage(file, maxW=1400, maxH=1400, quality=0.85) {
+  try {
+    const dataUrl = await readFileAsDataURL(file);
+    const img = await loadImage(dataUrl);
+    let { width:w, height:h } = img;
+    const ratio = Math.min(maxW / w, maxH / h, 1);
+    const cw = Math.round(w * ratio), ch = Math.round(h * ratio);
+    const canvas = document.createElement('canvas'); canvas.width = cw; canvas.height = ch;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, cw, ch);
+    return canvas.toDataURL('image/jpeg', quality);
+  } catch (e) {
+    console.error('compressImage failed, fallback to original', e);
+    return await readFileAsDataURL(file);
+  }
+}
+
+// Версионирование и миграции
+const SCHEMA_VERSION = 3;
+const loadVersion = () => +(localStorage.getItem('nd_version')||'0');
+const saveVersion = (v) => localStorage.setItem('nd_version', String(v));
+
+// Поставщики: базовый справочник
+const seedSuppliers = () => ([
+  { id: uid(), name: 'Базовый поставщик', currency: 'KZT', minOrder: 0, priceBreaks: [], leadTimeDays: 7, rating: 5 },
+]);
+
+const saveLS = (key, data) => {
+  try {
+    localStorage.setItem(key, JSON.stringify(data));
+  } catch (e) {
+    console.error('saveLS error for', key, e);
+    try { showToast('Недостаточно места в локальном хранилище. Фото будут сжаты или не сохранены.', 'warn'); } catch {}
+  }
+};
+const loadLS = (key, fallback) => {
+  try { const v = JSON.parse(localStorage.getItem(key) || "null"); return v ?? fallback; } catch { return fallback; }
+};
+
+const todayISO = () => new Date().toISOString().slice(0, 10);
+
+// ------- Доменные типы (комментарии) -------
+// RawItem: { id, name, category: 'Бриллиант'|'Металл'|'Работа', unit:'шт'|'г'|'ед', carat?, metal?, color?, costPerUnit, stockQty }
+// Model: { id, name, type:'Кольцо'|'Серьги'|'Подвеска'|'Браслет'|'Колье'|'Комплект'|..., defaultMetal?, defaultColor?, bom:[{rawItemId, qty}] }
+// JewelryStockItem: { id, modelId, metal, color, qty }
+// Order: { id, type:'Собственный'|'Клиентский', customer?, createdAt, status, lines:[{ id, modelId, metal, color, qty }], payments:[{id, date, amount, method, note}], produceFromRaw:boolean, notes? }
+// Ledger/Operations: { id, type:'RAW_IN'|'RAW_OUT'|'FG_IN'|'FG_OUT'|'PAYMENT', date, refId?, payload }
+
+// ------- Начальные данные -------
+const seedRaw = () => ([
+  { id: uid(), name: "Бриллиант 0.30 ct VVS", category: "Бриллиант", unit: "шт", carat: 0.30, costPerUnit: 90000, currency: 'KZT', stockQty: 10, safetyStock: 0, leadTimeDays: 7, supplierId: null, holdingCostPct: 0.2, orderCost: 0, priceHistory: [], priceBreaks: [] },
+  { id: uid(), name: "Бриллиант 0.50 ct VVS", category: "Бриллиант", unit: "шт", carat: 0.50, costPerUnit: 180000, currency: 'KZT', stockQty: 6, safetyStock: 0, leadTimeDays: 7, supplierId: null, holdingCostPct: 0.2, orderCost: 0, priceHistory: [], priceBreaks: [] },
+  { id: uid(), name: "Золото 585 белое (г)", category: "Металл", unit: "г", metal: "Золото", color: "Белый", costPerUnit: 35000, currency: 'KZT', stockQty: 50, safetyStock: 0, leadTimeDays: 7, supplierId: null, holdingCostPct: 0.2, orderCost: 0, priceHistory: [], priceBreaks: [] },
+  { id: uid(), name: "Золото 585 жёлтое (г)", category: "Металл", unit: "г", metal: "Золото", color: "Жёлтый", costPerUnit: 34000, currency: 'KZT', stockQty: 40, safetyStock: 0, leadTimeDays: 7, supplierId: null, holdingCostPct: 0.2, orderCost: 0, priceHistory: [], priceBreaks: [] },
+  { id: uid(), name: "Серебро 925 (г)", category: "Металл", unit: "г", metal: "Серебро", color: "Белый", costPerUnit: 600, currency: 'KZT', stockQty: 500, safetyStock: 0, leadTimeDays: 7, supplierId: null, holdingCostPct: 0.2, orderCost: 0, priceHistory: [], priceBreaks: [] },
+  { id: uid(), name: "Работа цеха (ед)", category: "Работа", unit: "ед", costPerUnit: 10000, currency: 'KZT', stockQty: 100, safetyStock: 0, leadTimeDays: 7, supplierId: null, holdingCostPct: 0.2, orderCost: 0, priceHistory: [], priceBreaks: [] },
+]);
+
+const seedModels = (raw) => {
+  const d030 = raw.find(r => r.name.includes("0.30"));
+  const goldW = raw.find(r => r.name.includes("Золото 585 белое"));
+  const silver = raw.find(r => r.name.includes("Серебро 925"));
+  const labor = raw.find(r => r.name.includes("Работа цеха"));
+  return [
+    { id: uid(), name: "Sirius Classic", type: "Кольцо", defaultMetal: "Золото", defaultColor: "Белый", bom: [
+      { rawItemId: d030?.id, qty: 1, wastePct: 0 },
+      { rawItemId: goldW?.id, qty: 3, wastePct: 0.02 },
+      { rawItemId: labor?.id, qty: 1, wastePct: 0 },
+    ]},
+    { id: uid(), name: "Sirius Silver", type: "Кольцо", defaultMetal: "Серебро", defaultColor: "Белый", bom: [
+      { rawItemId: d030?.id, qty: 1, wastePct: 0 },
+      { rawItemId: silver?.id, qty: 4, wastePct: 0.03 },
+      { rawItemId: labor?.id, qty: 1, wastePct: 0 },
+    ]},
+  ];
+};
+
+const STATUSES = ["Новый", "В производстве", "Готово", "Доставлено"];
+const METHODS = ["Наличными", "Карта", "Перевод", "Kaspi", "Другое"];
+
+// ------- Хук хранилища -------
+function useStore() {
+  const [rawItems, setRawItems] = useState(() => loadLS("nd_raw", seedRaw()));
+  const [models, setModels] = useState(() => loadLS("nd_models", seedModels(loadLS("nd_raw", seedRaw()))));
+  const [jewelryStock, setJewelryStock] = useState(() => loadLS("nd_fg", []));
+  const [orders, setOrders] = useState(() => loadLS("nd_orders", []));
+  const [ledger, setLedger] = useState(() => loadLS("nd_ledger", []));
+  const [settings, setSettings] = useState(() => ({ ...defaultSettings, ...loadLS("nd_settings", defaultSettings) }));
+  const [suppliers, setSuppliers] = useState(() => loadLS("nd_suppliers", seedSuppliers()));
+  const [pos, setPOs] = useState(() => loadLS("nd_pos", [])); // закупки
+  const [services, setServices] = useState(() => loadLS("nd_services", seedServices()));
+
+  // Миграции
+  useEffect(()=>{
+    const v = loadVersion();
+    if (v >= SCHEMA_VERSION) return;
+    // migrate rawItems
+    setRawItems(items => items.map(r => ({
+      ...r,
+      safetyStock: r.safetyStock ?? 0,
+      leadTimeDays: r.leadTimeDays ?? 7,
+      supplierId: r.supplierId ?? null,
+      holdingCostPct: r.holdingCostPct ?? 0.2,
+      orderCost: r.orderCost ?? 0,
+      currency: r.currency || 'KZT',
+      priceHistory: Array.isArray(r.priceHistory) && r.priceHistory.length>0 ? r.priceHistory : [{ date: new Date().toISOString(), price: r.costPerUnit||0, currency: r.currency||'KZT' }],
+      priceBreaks: Array.isArray(r.priceBreaks)? r.priceBreaks : [],
+    })));
+    // migrate models: ensure new pricing fields and variants
+    setModels(ms => ms.map(m => ensureVariants({
+      ...m,
+      bom: (m.bom||[]).map(b=> ({ rawItemId: b.rawItemId, qty: b.qty, wastePct: b.wastePct ?? 0 })),
+      salesPrice: m.salesPrice ?? 0,
+      salesCurrency: m.salesCurrency || 'KZT',
+      metalPricing: m.metalPricing || { 'Золото': 0, 'Серебро': 0 },
+      platingCostSilver: m.platingCostSilver || 0,
+      platingCurrencySilver: m.platingCurrencySilver || (m.salesCurrency || 'KZT'),
+      laborCost: m.laborCost || 0,
+      laborCurrency: m.laborCurrency || (m.salesCurrency || 'KZT'),
+      allowedMetals: m.allowedMetals || Array.from(new Set([m.defaultMetal||'Золото', 'Серебро'])),
+    })) );
+    // move 'Работа' в услуги
+    setServices(svcs => {
+      const arr = Array.isArray(svcs) && svcs.length>0 ? svcs : seedServices();
+      const works = (loadLS('nd_raw', [])||[]).filter(r=>r.category==='Работа');
+      const migrated = works.map(w => ({ id: uid(), name: w.name||'Работа цеха', price: w.costPerUnit||0, currency: w.currency||'KZT' }));
+      return [...arr, ...migrated];
+    });
+    setRawItems(items => items.filter(r=> r.category!=='Работа'));
+    // ensure suppliers seed exists
+    setSuppliers(s => (Array.isArray(s) && s.length>0) ? s : seedSuppliers());
+    saveVersion(SCHEMA_VERSION);
+  }, []);
+
+  useEffect(() => saveLS("nd_raw", rawItems), [rawItems]);
+  useEffect(() => saveLS("nd_models", models), [models]);
+  useEffect(() => saveLS("nd_fg", jewelryStock), [jewelryStock]);
+  useEffect(() => saveLS("nd_orders", orders), [orders]);
+  useEffect(() => saveLS("nd_ledger", ledger), [ledger]);
+  useEffect(() => saveLS("nd_settings", settings), [settings]);
+  useEffect(() => saveLS("nd_suppliers", suppliers), [suppliers]);
+  useEffect(() => saveLS("nd_pos", pos), [pos]);
+  useEffect(() => saveLS("nd_services", services), [services]);
+
+  const resetAll = () => {
+    const r = seedRaw();
+    setRawItems(r);
+    setModels(seedModels(r));
+    setJewelryStock([]);
+    setOrders([]);
+    setLedger([]);
+    setSuppliers(seedSuppliers());
+    setServices(seedServices());
+    setPOs([]);
+    saveVersion(SCHEMA_VERSION);
+  };
+
+  const exportJSON = () => {
+    const blob = new Blob([JSON.stringify({ version: SCHEMA_VERSION, rawItems, models, jewelryStock, orders, ledger, settings, suppliers, pos }, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `neo-diamond-warehouse-${todayISO()}.json`; a.click(); URL.revokeObjectURL(url);
+  };
+
+  const importJSON = async (file) => {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    if (data.rawItems) setRawItems(data.rawItems);
+    if (data.models) setModels(data.models);
+    if (data.jewelryStock) setJewelryStock(data.jewelryStock);
+    if (data.orders) setOrders(data.orders);
+    if (data.ledger) setLedger(data.ledger);
+    if (data.settings) setSettings({ ...defaultSettings, ...data.settings });
+    if (data.suppliers) setSuppliers(data.suppliers);
+    if (data.pos) setPOs(data.pos);
+    if (data.services) setServices(data.services);
+    saveVersion(data.version ? +data.version : SCHEMA_VERSION);
+  };
+
+  return { rawItems, setRawItems, models, setModels, jewelryStock, setJewelryStock, orders, setOrders, ledger, setLedger, settings, setSettings, suppliers, setSuppliers, services, setServices, pos, setPOs, resetAll, exportJSON, importJSON };
+}
+
+// ------- Компоненты UI -------
+const Section = ({ title, children, right }) => (
+  <div className="bg-white/80 backdrop-blur rounded-2xl shadow-sm border border-slate-200 p-4 md:p-6 mb-6 ani-fade-in hover:shadow-md transition-shadow">
+    <div className="flex items-center justify-between mb-4">
+      <h2 className="text-xl md:text-2xl font-bold text-slate-800">{title}</h2>
+      {right}
+    </div>
+    {children}
+  </div>
+);
+
+const Button = ({ className = "", children, onClick, type = "button", variant = "primary", disabled }) => {
+  const base = "relative overflow-hidden inline-flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-semibold transition active:scale-[.98] disabled:opacity-40";
+  const styles = {
+    primary: "bg-slate-900 text-white hover:bg-slate-800",
+    ghost: "bg-transparent hover:bg-slate-100 text-slate-700",
+    outline: "border border-slate-300 hover:bg-slate-50",
+    danger: "bg-red-600 text-white hover:bg-red-500",
+    success: "bg-emerald-600 text-white hover:bg-emerald-500",
+    warn: "bg-amber-500 text-white hover:bg-amber-400",
+  };
+  return (
+    <button
+      type={type}
+      disabled={disabled}
+      className={`${base} ${styles[variant] || styles.primary} ${className}`}
+      onMouseDown={(e)=>{
+        const btn = e.currentTarget; const r = document.createElement('span');
+        const rect = btn.getBoundingClientRect(); const size = Math.max(rect.width, rect.height);
+        r.className = 'ripple'; r.style.width = r.style.height = size + 'px';
+        r.style.left = (e.clientX - rect.left - size/2) + 'px';
+        r.style.top = (e.clientY - rect.top - size/2) + 'px';
+        btn.appendChild(r); setTimeout(()=>r.remove(), 600);
+      }}
+      onClick={onClick}
+    >{children}</button>
+  );
+};
+
+const Input = ({ label, ...props }) => (
+  <label className="block text-sm mb-3">
+    <span className="block text-slate-600 mb-1">{label}</span>
+    <input {...props} className={`w-full rounded-xl border border-slate-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-400 ${props.className||''}`} />
+  </label>
+);
+
+const Select = ({ label, value, onChange, options, disabled }) => (
+  <label className="block text-sm mb-3">
+    <span className="block text-slate-600 mb-1">{label}</span>
+    <select value={value} onChange={e=>onChange(e.target.value)} disabled={disabled} className="w-full rounded-xl border border-slate-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-400">
+      {options.map(o => <option key={o} value={o}>{o}</option>)}
+    </select>
+  </label>
+);
+
+const Badge = ({ children, color = "gray" }) => {
+  const map = {
+    gray: "bg-slate-100 text-slate-700",
+    blue: "bg-blue-100 text-blue-700",
+    green: "bg-emerald-100 text-emerald-700",
+    yellow: "bg-amber-100 text-amber-800",
+    red: "bg-red-100 text-red-700",
+    violet: "bg-violet-100 text-violet-700",
+  };
+  return <span className={`inline-block px-2.5 py-1 rounded-full text-xs font-semibold ${map[color]}`}>{children}</span>;
+};
+
+const Icon = ({ name, className = "w-4 h-4" }) => {
+  const paths = {
+    home: <path d="M3 10l9-7 9 7v10a1 1 0 01-1 1h-5v-7H9v7H4a1 1 0 01-1-1V10z" stroke="currentColor" strokeWidth="2" fill="none"/>,
+    warehouse: <path d="M3 7l9-4 9 4v12a1 1 0 01-1 1H4a1 1 0 01-1-1V7z M7 11h10M7 15h10" stroke="currentColor" strokeWidth="2" fill="none"/>,
+    cart: <path d="M3 4h2l3 12h8l3-8H6" stroke="currentColor" strokeWidth="2" fill="none"/>,
+    analytics: <path d="M5 13h3v6H5zm5-8h3v14h-3zm5 5h3v9h-3z" fill="currentColor"/>,
+    calendar: <path d="M7 3v4m10-4v4M3 9h18M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" stroke="currentColor" strokeWidth="2"/>,
+    gear: <path d="M12 8a4 4 0 100 8 4 4 0 000-8zm8 4l-2 1 1 3-3 2-1-2-3 1-1 3H9l-1-3-3-1-1 2-3-2 1-3-2-1 2-3-1-3 3-2 1 2 3-1 1-3h2l1 3 3 1 1-2 3 2-1 3z" stroke="currentColor" strokeWidth="1.5" fill="none"/>,
+    plus: <path d="M12 5v14m-7-7h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/> ,
+    x: <path d="M6 6l12 12M6 18L18 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>,
+    money: <path d="M4 7h16v10H4z M8 12h8 M6 9h.01 M18 9h.01 M6 15h.01 M18 15h.01" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>,
+    play: <path d="M8 5v14l11-7z" fill="currentColor"/>,
+    arrowR: <path d="M5 12h14m-7-7l7 7-7 7" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>,
+    arrowL: <path d="M19 12H5m7-7l-7 7 7 7" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>,
+    download: <path d="M12 3v12m0 0l-4-4m4 4l4-4M4 21h16" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>,
+    upload: <path d="M12 21V9m0 0l4 4m-4-4l-4 4M4 3h16" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>,
+    search: <path d="M21 21l-4.35-4.35M10 18a8 8 0 100-16 8 8 0 000 16z" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>,
+    edit: <path d="M4 13.5V20h6.5l8.7-8.7-6.5-6.5L4 13.5z" stroke="currentColor" strokeWidth="2" fill="none"/>,
+    box: <path d="M3 7l9 5 9-5-9-5-9 5zm0 0v10l9 5 9-5V7" stroke="currentColor" strokeWidth="2" fill="none"/>,
+    check: <path d="M5 13l4 4L19 7" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>,
+    trash: <path d="M4 7h16M10 11v6m4-6v6M6 7l1 13h10l1-13M9 7l1-3h4l1 3" stroke="currentColor" strokeWidth="2"/>,
+  };
+  return (
+    <svg viewBox="0 0 24 24" className={className} aria-hidden>
+      {paths[name]}
+    </svg>
+  );
+};
+
+class ErrorBoundary extends React.Component {
+  constructor(props){ super(props); this.state = { error: null, info: null }; }
+  componentDidCatch(error, info){ console.error('UI error:', error, info); this.setState({ error, info }); }
+  render(){
+    if (this.state.error) {
+      return (
+        <div className="bg-red-50 border border-red-200 text-red-700 rounded-xl p-4">
+          <div className="font-semibold mb-1">Произошла ошибка интерфейса</div>
+          <div className="text-sm">{String(this.state.error.message || this.state.error)}</div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// ------- Логика себестоимости -------
+function getVariant(model, metal, color) {
+  if (!model) return null;
+  const variants = model.variants || [];
+  const v = variants.find(v => v.metal === metal && (!color || (v.color||model.defaultColor) === color))
+    || variants.find(v => v.metal === metal);
+  if (v) return v;
+  // Fallback виртуальный вариант из старых полей модели
+  const mp = model.metalPricing || {};
+  const extraCost = +mp[metal] || 0;
+  return {
+    id: `virt-${model.id}-${metal}`,
+    metal,
+    color: model.defaultColor || 'Белый',
+    salesPrice: model.salesPrice || 0,
+    salesCurrency: model.salesCurrency || 'KZT',
+    extraCost,
+    extraCurrency: (model.salesCurrency || 'KZT'),
+    platingEnabled: metal === 'Серебро' ? Boolean(model.platingCostSilver) : false,
+    platingCost: model.platingCostSilver || 0,
+    platingCurrency: model.platingCurrencySilver || (model.salesCurrency || 'KZT'),
+    photoUrl: model.photoUrl,
+  };
+}
+
+function getVariantPhoto(model, variant, color) {
+  return (model?.photosByColor?.[color]) || (variant?.photosByColor?.[color]) || variant?.photoUrl || model?.photoUrl || null;
+}
+
+function ensureVariants(model) {
+  const metals = (model.allowedMetals && model.allowedMetals.length) ? model.allowedMetals : [model.defaultMetal||'Золото', 'Серебро'];
+  const have = new Set((model.variants||[]).map(v=>`${v.metal}|${v.color||model.defaultColor||'Белый'}`));
+  const baseCur = model.salesCurrency || 'KZT';
+  const list = [...(model.variants||[])];
+  metals.forEach(metal => {
+    const key = `${metal}|${model.defaultColor||'Белый'}`;
+    if (!have.has(key)) {
+      list.push({
+        id: uid(),
+        metal,
+        color: model.defaultColor || 'Белый',
+        salesPrice: model.salesPrice || 0,
+        salesCurrency: baseCur,
+        extraCost: (model.metalPricing||{})[metal] || 0,
+        extraCurrency: baseCur,
+        laborCost: (typeof model.laborCost === 'number') ? model.laborCost : 0,
+        laborCurrency: model.laborCurrency || (model.salesCurrency||'KZT'),
+        platingEnabled: false,
+        platingCost: metal==='Серебро'? (model.platingCostSilver||0) : 0,
+        platingCurrency: metal==='Серебро'? (model.platingCurrencySilver||baseCur) : baseCur,
+        photoUrl: model.photoUrl || null,
+      });
+    }
+  });
+  return { ...model, variants: list };
+}
+
+function modelCost(model, rawItems, settings = defaultSettings, metalOverride, colorOverride) {
+  if (!model) return 0;
+  // База: только бриллианты из BOM (категория "Бриллиант")
+  let base = 0;
+  for (const b of (model.bom||[])) {
+    const r = rawItems.find(x => x.id === b.rawItemId);
+    if (!r) continue;
+    if (r.category === 'Металл' || r.category === 'Работа') continue;
+    const cur = r.currency || 'KZT';
+    const waste = b.wastePct ? (1 + b.wastePct) : 1;
+    const amt = (r.costPerUnit || 0) * (b.qty || 0) * waste;
+    base += convert(amt, cur, settings.currency, settings.rates);
+  }
+  // Надбавка/покрытие по варианту
+  const metal = metalOverride || model.defaultMetal || 'Золото';
+  const variant = getVariant(model, metal, colorOverride);
+  const metalAdd = convert(variant?.extraCost||0, variant?.extraCurrency|| (model.salesCurrency||'KZT'), settings.currency, settings.rates);
+  let plating = 0;
+  if (metal === 'Серебро') {
+    if (colorOverride && colorOverride !== 'Белый') {
+      plating = servicePrice('Покрытие золотом', settings);
+    } else if (variant?.platingEnabled) {
+      plating = convert(variant.platingCost||0, variant.platingCurrency|| (model.salesCurrency||'KZT'), settings.currency, settings.rates);
+    }
+  }
+  // Работа цеха: вариация может переопределять значения
+  const laborCur = (variant?.laborCurrency) || model.laborCurrency || (model.salesCurrency || 'KZT');
+  const laborSrc = (variant && typeof variant.laborCost === 'number') ? variant.laborCost : (model.laborCost || 0);
+  const labor = convert(laborSrc, laborCur, settings.currency, settings.rates);
+  return base + labor + metalAdd + plating;
+}
+
+// Разбивка себестоимости по компонентам для вариации
+function modelCostBreakdown(model, rawItems, settings = defaultSettings, metalOverride, colorOverride) {
+  if (!model) return { base:0, labor:0, metalAdd:0, plating:0, total:0 };
+  let base = 0;
+  for (const b of (model.bom||[])) {
+    const r = rawItems.find(x => x.id === b.rawItemId);
+    if (!r) continue;
+    if (r.category === 'Металл' || r.category === 'Работа') continue;
+    const cur = r.currency || 'KZT';
+    const waste = b.wastePct ? (1 + b.wastePct) : 1;
+    const amt = (r.costPerUnit || 0) * (b.qty || 0) * waste;
+    base += convert(amt, cur, settings.currency, settings.rates);
+  }
+  const metal = metalOverride || model.defaultMetal || 'Золото';
+  const variant = getVariant(model, metal, colorOverride);
+  const metalAdd = convert(variant?.extraCost||0, variant?.extraCurrency|| (model.salesCurrency||'KZT'), settings.currency, settings.rates);
+  let plating = 0;
+  if (metal === 'Серебро') {
+    if (colorOverride && colorOverride !== 'Белый') {
+      plating = servicePrice('Покрытие золотом', settings);
+    } else if (variant?.platingEnabled) {
+      plating = convert(variant.platingCost||0, variant.platingCurrency|| (model.salesCurrency||'KZT'), settings.currency, settings.rates);
+    }
+  }
+  const laborCur = (variant?.laborCurrency) || model.laborCurrency || (model.salesCurrency || 'KZT');
+  const laborSrc = (variant && typeof variant.laborCost === 'number') ? variant.laborCost : (model.laborCost || 0);
+  const labor = convert(laborSrc, laborCur, settings.currency, settings.rates);
+  const total = base + labor + metalAdd + plating;
+  return { base, labor, metalAdd, plating, total };
+}
+
+// Потребление сырья из леджера (по RAW_OUT через BOM)
+function computeRawUsageByDay(ledger, models) {
+  const map = {};
+  const findModelByName = (name) => models.find(m => m.name === name);
+  for (const l of ledger) {
+    if (l.type !== 'RAW_OUT') continue;
+    const d = (l.date||'').slice(0,10);
+    const m = findModelByName(l.payload?.model || '');
+    const qty = l.payload?.qty || 0;
+    if (!m || !qty) continue;
+    for (const b of (m.bom||[])) {
+      const waste = b.wastePct ? (1 + b.wastePct) : 1;
+      const used = (b.qty||0) * qty * waste;
+      map[d] = map[d] || {};
+      map[d][b.rawItemId] = (map[d][b.rawItemId]||0) + used;
+    }
+  }
+  return map; // { 'YYYY-MM-DD': { rawItemId: qty, ... }, ... }
+}
+
+function avgDailyUsage(rawItemId, usageByDay, days=30) {
+  const today = new Date();
+  let sum = 0;
+  for (let i=0;i<days;i++) {
+    const d = new Date(today); d.setDate(d.getDate()-i);
+    const key = d.toISOString().slice(0,10);
+    sum += (usageByDay[key]?.[rawItemId] || 0);
+  }
+  return sum / days;
+}
+
+function reorderPoint(raw, avgDaily) {
+  return (avgDaily * (raw.leadTimeDays||0)) + (raw.safetyStock||0);
+}
+
+function daysToStockout(raw, avgDaily) {
+  if (!avgDaily) return Infinity;
+  return (raw.stockQty||0) / avgDaily;
+}
+
+// ------- Операции склада -------
+function consumeRaw(rawItems, setRawItems, bomEntries, multiplier = 1) {
+  // Проверка остатков
+  for (const b of bomEntries) {
+    const item = rawItems.find(r => r.id === b.rawItemId);
+    const need = (b.qty || 0) * multiplier;
+    if (!item) throw new Error("В BOM есть несуществующее сырьё");
+    if (item.stockQty < need) throw new Error(`Недостаточно сырья: ${item.name}. Нужно ${need} ${item.unit}, доступно ${item.stockQty} ${item.unit}`);
+  }
+  // Списание
+  const newRaw = rawItems.map(r => {
+    const b = bomEntries.find(x => x.rawItemId === r.id);
+    if (!b) return r;
+    return { ...r, stockQty: Math.max(0, +(r.stockQty - b.qty * multiplier).toFixed(4)) };
+  });
+  setRawItems(newRaw);
+}
+
+function addFG(jewelryStock, setJewelryStock, modelId, metal, color, qty) {
+  const idx = jewelryStock.findIndex(j => j.modelId === modelId && j.metal === metal && j.color === color);
+  const next = [...jewelryStock];
+  if (idx >= 0) next[idx] = { ...next[idx], qty: (next[idx].qty || 0) + qty };
+  else next.push({ id: uid(), modelId, metal, color, qty });
+  setJewelryStock(next);
+}
+
+function issueFG(jewelryStock, setJewelryStock, modelId, metal, color, qty) {
+  const idx = jewelryStock.findIndex(j => j.modelId === modelId && j.metal === metal && j.color === color);
+  if (idx < 0) throw new Error("На складе украшений нет нужной позиции");
+  const cur = jewelryStock[idx];
+  if (cur.qty < qty) throw new Error(`Недостаточно на складе украшений (есть ${cur.qty}, нужно ${qty})`);
+  const next = [...jewelryStock];
+  next[idx] = { ...cur, qty: cur.qty - qty };
+  setJewelryStock(next);
+}
+
+// ------- Главный компонент -------
+function NeoDiamondWMS() {
+  const store = useStore();
+  const { rawItems, setRawItems, models, setModels, jewelryStock, setJewelryStock, orders, setOrders, ledger, setLedger, settings, setSettings, suppliers, setSuppliers, services, setServices, pos, setPOs, resetAll, exportJSON, importJSON } = store;
+
+  // Новая навигация
+  const [section, setSection] = useState('home');
+  const [sub, setSub] = useState({ warehouse:'raw', purchases:'suppliers', analytics:'cost', planning:'capacity' });
+
+  // Метрики
+  const metrics = useMemo(() => {
+    const rawValue = rawItems.reduce((s, r) => s + convert((r.costPerUnit||0) * (r.stockQty||0), r.currency||'KZT', settings.currency, settings.rates), 0);
+    const fgCount = jewelryStock.reduce((s, j) => s + j.qty, 0);
+    const openOrders = orders.filter(o => ["Новый", "В производстве", "Готово"].includes(o.status)).length;
+    const todayIn = ledger
+      .filter(l => l.type === "PAYMENT" && l.date?.slice(0,10) === todayISO())
+      .reduce((s, l) => s + convert(l.payload?.amount||0, l.payload?.currency||'KZT', settings.currency, settings.rates), 0);
+    // usage and stock health
+    const usageByDay = computeRawUsageByDay(ledger, models);
+    let lowROP = 0; let lowSS = 0;
+    for (const r of rawItems) {
+      const u30 = avgDailyUsage(r.id, usageByDay, 30);
+      const rop = reorderPoint(r, u30);
+      if ((r.stockQty||0) < rop) lowROP++;
+      if ((r.stockQty||0) < (r.safetyStock||0)) lowSS++;
+    }
+    return { rawValue, fgCount, openOrders, todayIn, lowROP, lowSS };
+  }, [rawItems, jewelryStock, orders, ledger, settings, models]);
+
+  const nav = [
+    { id:'home', label:'Главная', icon:'home' },
+    { id:'catalog', label:'Каталог', icon:'box' },
+    { id:'warehouse', label:'Склад', icon:'warehouse', subs:[{id:'raw',label:'Сырьё'},{id:'services',label:'Услуги'},{id:'fg',label:'Украшения'}]},
+    { id:'orders', label:'Заказы', icon:'play' },
+    { id:'purchases', label:'Закупки', icon:'cart', subs:[{id:'suppliers',label:'Поставщики'},{id:'po',label:'Заказы поставщикам'}]},
+    { id:'finance', label:'Финансы', icon:'money' },
+    { id:'analytics', label:'Аналитика', icon:'analytics', subs:[{id:'cost',label:'Себестоимость'},{id:'revenue',label:'Выручка по дням'},{id:'abcxyz',label:'ABC/XYZ'},{id:'margin',label:'Маржа по моделям'},{id:'stockdays',label:'Дни запаса (сырьё)'},{id:'stockdaysModels',label:'Дни запаса (модели)'}]},
+    { id:'planning', label:'Планирование', icon:'calendar', subs:[{id:'capacity',label:'Производство'},{id:'reorder',label:'Рекомендации закупок'}]},
+    { id:'settings', label:'Настройки', icon:'gear' },
+  ];
+
+  const renderContent = () => {
+    if (section==='home') return <Dashboard metrics={metrics} rawItems={rawItems} jewelryStock={jewelryStock} orders={orders} ledger={ledger} models={models} settings={settings} setSection={setSection} />;
+    if (section==='orders') return <OrdersBoard store={store} />;
+    if (section==='catalog') {
+      return <ModelsBOM models={models} setModels={setModels} rawItems={rawItems} settings={settings} />;
+    }
+    if (section==='warehouse') {
+      const s = sub.warehouse;
+      if (s==='raw') return <RawWarehouse rawItems={rawItems} setRawItems={setRawItems} settings={settings} setSettings={setSettings} />;
+      if (s==='fg') return <FGWarehouse models={models} jewelryStock={jewelryStock} setJewelryStock={setJewelryStock} settings={settings} />;
+      if (s==='services') return <Services services={services} setServices={setServices} settings={settings} />;
+    }
+    if (section==='purchases') {
+      const s = sub.purchases;
+      if (s==='suppliers') return <Suppliers suppliers={suppliers} setSuppliers={setSuppliers} settings={settings} />;
+      if (s==='po') return <POs suppliers={suppliers} rawItems={rawItems} models={models} jewelryStock={jewelryStock} setJewelryStock={setJewelryStock} setRawItems={setRawItems} settings={settings} ledger={ledger} setLedger={setLedger} pos={pos} setPOs={setPOs} />;
+    }
+    if (section==='finance') return <Finance ledger={ledger} orders={orders} settings={settings} />;
+    if (section==='analytics') {
+      const s = sub.analytics;
+      if (s==='cost') return <AnalyticsCost models={models} rawItems={rawItems} settings={settings} />;
+      if (s==='revenue') return <AnalyticsRevenue ledger={ledger} settings={settings} />;
+      if (s==='abcxyz') return <AnalyticsABCXYZ models={models} orders={orders} settings={settings} />;
+      if (s==='margin') return <AnalyticsMargin models={models} rawItems={rawItems} settings={settings} />;
+      if (s==='stockdays') return <AnalyticsStockDays rawItems={rawItems} ledger={ledger} models={models} settings={settings} />;
+      if (s==='stockdaysModels') return <AnalyticsStockDaysModels models={models} jewelryStock={jewelryStock} orders={orders} />;
+    }
+    if (section==='planning') {
+      const s = sub.planning;
+      if (s==='capacity') return <Capacity models={models} rawItems={rawItems} settings={settings} setTab={()=>{}} />;
+      if (s==='reorder') return <Section title="Рекомендации закупок"><ReorderRecommendations settings={settings} /></Section>;
+    }
+    if (section==='settings') return <Backup exportJSON={exportJSON} importJSON={importJSON} resetAll={resetAll} settings={settings} setSettings={setSettings} />;
+    return null;
+  };
+
+  const renderSub = () => {
+    const entry = nav.find(n=>n.id===section);
+    if (!entry?.subs) return null;
+    const key = section; const cur = sub[key];
+    return (
+      <div className="flex gap-2 mb-4">
+        {entry.subs.map(s => (
+          <button key={s.id} onClick={()=>setSub(p=>({...p, [key]: s.id}))} className={`px-3 py-2 rounded-xl text-sm font-semibold ${cur===s.id? 'bg-slate-900 text-white':'bg-white border border-slate-300 text-slate-700 hover:bg-slate-50'}`}>{s.label}</button>
+        ))}
+      </div>
+    );
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-800 flex">
+      <aside className="w-64 bg-white border-r border-slate-200 fixed inset-y-0 left-0 flex flex-col">
+        <div className="px-4 py-4 flex items-center gap-3 border-b border-slate-100">
+          <div className="w-9 h-9 rounded-xl bg-slate-900 text-white grid place-items-center font-black">ND</div>
+          <div className="font-bold">Neo Diamond</div>
+        </div>
+        <nav className="p-2 space-y-1 overflow-auto">
+          {nav.map(n => (
+            <button key={n.id} onClick={()=>setSection(n.id)} className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg ${section===n.id? 'bg-slate-900 text-white':'text-slate-700 hover:bg-slate-100'}`}>
+              <Icon name={n.icon}/>
+              <span className="text-sm font-semibold">{n.label}</span>
+            </button>
+          ))}
+        </nav>
+        <div className="px-3 py-3 mt-auto text-xs text-slate-500">Версия схемы: v{SCHEMA_VERSION}</div>
+      </aside>
+      <div className="flex-1 ml-64 min-h-screen flex flex-col">
+        <header className="sticky top-0 z-40 bg-white/70 backdrop-blur border-b border-slate-200">
+          <div className="px-4 md:px-6 py-3 flex items-center gap-3">
+            <div className="font-bold text-lg">{nav.find(n=>n.id===section)?.label}</div>
+            <div className="ml-auto flex items-center gap-2">
+              <label className="text-xs text-slate-500">Валюта</label>
+              <select value={settings.currency} onChange={e=>setSettings({ ...settings, currency: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1 text-sm">
+                {Object.keys(settings.rates).map(c=> <option key={c} value={c}>{c}</option>)}
+              </select>
+              <label className="text-xs text-slate-500 ml-2">Роль</label>
+              <select value={settings.role} onChange={e=>setSettings({ ...settings, role: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1 text-sm">
+                {['admin','manager','master'].map(r=> <option key={r} value={r}>{r}</option>)}
+              </select>
+            </div>
+          </div>
+        </header>
+        <main className="px-4 md:px-6 py-6 max-w-7xl">
+          {renderSub()}
+          <ErrorBoundary>
+            {renderContent()}
+          </ErrorBoundary>
+        </main>
+        <footer className="px-4 md:px-6 py-6 text-xs text-slate-500">Сделано для Neo Diamond · локальное хранение</footer>
+        <Toasts />
+      </div>
+    </div>
+  );
+}
+
+function EditRawParamsModal({ raw, suppliers, onClose, onSave }) {
+  const [supplierId, setSupplierId] = useState(raw?.supplierId||'');
+  const [safetyStock, setSafetyStock] = useState(raw?.safetyStock||0);
+  const [leadTimeDays, setLeadTimeDays] = useState(raw?.leadTimeDays||7);
+  const [holdingCostPct, setHoldingCostPct] = useState(raw?.holdingCostPct||0.2);
+  const [orderCost, setOrderCost] = useState(raw?.orderCost||0);
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 overflow-auto p-4">
+      <div className="w-full max-w-xl bg-white rounded-2xl p-4 md:p-6 border border-slate-200 mx-auto my-8 max-h-[85vh] overflow-auto">
+        <div className="flex items-center justify-between mb-3"><div className="text-lg font-bold">Параметры закупки</div><button className="p-2" onClick={onClose}><Icon name="x" className="w-5 h-5"/></button></div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <label className="block text-sm mb-3">
+            <span className="block text-slate-600 mb-1">Поставщик</span>
+            <select value={supplierId} onChange={e=>setSupplierId(e.target.value)} className="w-full rounded-xl border border-slate-300 px-3 py-2">
+              <option value="">—</option>
+              {suppliers.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+          </label>
+          <Input label="Безопасный запас" type="number" value={safetyStock} onChange={e=>setSafetyStock(+e.target.value)} />
+          <Input label="Lead time (дней)" type="number" value={leadTimeDays} onChange={e=>setLeadTimeDays(+e.target.value)} />
+          <Input label="Стоимость заказа (фикс)" type="number" value={orderCost} onChange={e=>setOrderCost(+e.target.value)} />
+          <Input label="Удержание (% год)" type="number" value={holdingCostPct} onChange={e=>setHoldingCostPct(+e.target.value)} />
+        </div>
+        <div className="flex items-center justify-end gap-2 mt-3">
+          <Button variant="ghost" onClick={onClose}>Отмена</Button>
+          <Button onClick={()=> onSave({ supplierId: supplierId||null, safetyStock, leadTimeDays, orderCost, holdingCostPct })}><Icon name="check"/> Сохранить</Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// TabBtn удалён — используется боковая навигация
+
+// ------- Дашборд -------
+function Dashboard({ metrics, rawItems, jewelryStock, orders, ledger, models, settings, setSection }) {
+  const statusMap = STATUSES.reduce((acc, st) => (acc[st] = orders.filter(o=>o.status===st).length, acc), {});
+  const [range, setRange] = useState('3m'); // 1w,1m,3m,6m,12m
+  return (
+    <div>
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+        <StatCard title="Стоимость сырья" value={moneyFmt(metrics.rawValue, settings.currency)} sub="Склад сырья" />
+        <StatCard title="Готовых изделий" value={fmt.format(metrics.fgCount)} sub="Склад украшений" />
+        <StatCard title="Открытые заказы" value={fmt.format(metrics.openOrders)} sub={`Новый/В произв./Готово`} />
+        <StatCard title="Поступления сегодня" value={moneyFmt(metrics.todayIn, settings.currency)} sub={new Date().toLocaleDateString('ru-RU')} />
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <Section title="Статусы заказов" right={<Button variant="ghost" onClick={()=>setSection('orders')}>Перейти к заказам →</Button>}>
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+            {STATUSES.map((s)=> (
+              <div key={s} className="p-4 border border-slate-200 rounded-xl bg-white">
+                <div className="text-sm text-slate-500 mb-1">{s}</div>
+                <div className="text-2xl font-bold">{statusMap[s]||0}</div>
+              </div>
+            ))}
+          </div>
+        </Section>
+        <ChartCard type="line" title="Поступления по дням" dataBuilder={()=>{
+          const byDay = {};
+          (ledger||[]).filter(l=>l.type==='PAYMENT').forEach(p=>{ const d=p.date.slice(0,10); byDay[d]=(byDay[d]||0)+convert(p.payload.amount,p.payload.currency||'KZT',settings.currency,settings.rates); });
+          const labels = Object.keys(byDay).sort();
+          const values = labels.map(d=>byDay[d]);
+          return { labels, datasets:[{ label:'Поступления', data: values, borderColor:'#0ea5e9', backgroundColor:'rgba(14,165,233,0.2)', tension:.3 }] };
+        }}/>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
+        <DashboardTopMargin models={models} rawItems={rawItems} settings={settings} />
+        <PopularModels models={models} orders={orders} ledger={ledger} settings={settings} range={range} onRangeChange={setRange} onlyChart />
+        <DashboardAvgProduction models={models} orders={orders} ledger={ledger} />
+        <DashboardModelDOS models={models} jewelryStock={jewelryStock} orders={orders} />
+      </div>
+    </div>
+  );
+}
+
+const StatCard = ({ title, value, sub }) => (
+  <div className="p-5 bg-white rounded-2xl border border-slate-200 shadow-sm">
+    <div className="text-slate-500 text-sm">{title}</div>
+    <div className="text-2xl md:text-3xl font-extrabold mt-1">{value}</div>
+    <div className="text-slate-400 text-xs mt-1">{sub}</div>
+  </div>
+);
+
+function ChartCard({ type='line', title, dataBuilder }) {
+  const ref = React.useRef(null);
+  useEffect(() => {
+    if (!window.Chart || !ref.current) return;
+    const ctx = ref.current.getContext('2d');
+    const data = dataBuilder();
+    const chart = new Chart(ctx, { type, data, options: { responsive:true, animation:{ duration: 500, easing: 'easeOutQuart' }, plugins:{ legend:{ display: type!=='doughnut' }}, scales: type==='doughnut'? {} : { x:{ grid:{ display:false }}, y:{ grid:{ color:'#e5e7eb' }}} } });
+    return () => chart.destroy();
+  }, [type, dataBuilder]);
+  return (
+    <div className="bg-white rounded-2xl border border-slate-200 p-4 ani-pop hover:shadow-md transition">
+      <div className="text-slate-700 font-semibold mb-2">{title}</div>
+      <canvas ref={ref} height="140"/>
+    </div>
+  );
+}
+
+function ReorderRecommendations({ settings }) {
+  const rawItems = loadLS('nd_raw', []);
+  const models = loadLS('nd_models', []);
+  const suppliers = loadLS('nd_suppliers', []);
+  const usageByDay = useMemo(()=> computeRawUsageByDay(loadLS('nd_ledger', []), models), [models]);
+  const rows = rawItems.map(r => {
+    const u30 = avgDailyUsage(r.id, usageByDay, 30);
+    const rop = reorderPoint(r, u30);
+    const need = Math.max(0, Math.ceil(rop - (r.stockQty||0)));
+    const days = daysToStockout(r, u30);
+    const sup = suppliers.find(s=>s.id===r.supplierId);
+    return { r, u30, rop, need, days, supName: sup?.name || '—' };
+  }).filter(x => x.need>0).sort((a,b)=> a.days - b.days).slice(0, 8);
+
+  if (!rows.length) return <div className="text-sm text-slate-500">Пока всё выше ROP</div>;
+  return (
+    <div className="overflow-auto">
+      <table className="min-w-full text-sm">
+        <thead>
+          <tr className="text-left text-slate-500"><th className="py-2">Сырьё</th><th>Поставщик</th><th className="text-right">ROP</th><th className="text-right">Остаток</th><th className="text-right">Реком. заказ</th><th className="text-right">Дней до дефицита</th></tr>
+        </thead>
+        <tbody>
+          {rows.map(x => (
+            <tr key={x.r.id} className="border-t border-slate-100">
+              <td className="py-2 font-medium">{x.r.name}</td>
+              <td className="text-slate-600">{x.supName}</td>
+              <td className="text-right">{fmt.format(Math.ceil(x.rop))}</td>
+              <td className="text-right">{fmt.format(x.r.stockQty)} {x.r.unit}</td>
+              <td className="text-right">{fmt.format(x.need)} {x.r.unit}</td>
+              <td className={`text-right ${x.days<7?'text-red-600':x.days<14?'text-amber-600':''}`}>{Number.isFinite(x.days)? Math.floor(x.days) : '∞'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function Toasts() {
+  const [items, setItems] = useState([]);
+  useEffect(()=>{
+    const handler = (e) => {
+      const t = e.detail; setItems(arr => [...arr, t]); setTimeout(()=> setItems(arr => arr.filter(x=>x.id!==t.id)), 2500);
+    };
+    window.addEventListener('nd:toast', handler); return () => window.removeEventListener('nd:toast', handler);
+  }, []);
+  const palette = { info:'bg-slate-900 text-white', success:'bg-emerald-600 text-white', error:'bg-red-600 text-white' };
+  return (
+    <div className="fixed bottom-4 right-4 z-[60] space-y-2">
+      {items.map(t => (
+        <div key={t.id} className={`ani-pop rounded-xl px-3 py-2 shadow-lg ${palette[t.type]||palette.info}`}>{t.text}</div>
+      ))}
+    </div>
+  );
+}
+
+function DashboardTopMargin({ models, rawItems, settings }) {
+  const rows = models.map(m => {
+    const margin = Math.max(0, convert(m.salesPrice||0, m.salesCurrency||'KZT', settings.currency, settings.rates) - modelCost(m, rawItems, settings));
+    return { name: m.name, margin };
+  }).sort((a,b)=> b.margin - a.margin).slice(0,10);
+  const labels = rows.map(r=>r.name);
+  const data = rows.map(r=>r.margin);
+  return (
+    <ChartCard type="bar" title="Маржа по моделям" dataBuilder={()=>({ labels, datasets:[{ label:'Маржа', data, backgroundColor:'#22c55e' }] })} />
+  );
+}
+
+function DashboardAvgProduction({ models, orders, ledger }) {
+  const usage = React.useMemo(()=>{
+    const fgInByOrder = {}; (ledger||[]).filter(l=>l.type==='FG_IN' && l.refId).forEach(l=>{ fgInByOrder[l.refId] = Math.min(fgInByOrder[l.refId]||Infinity, new Date(l.date).getTime()); });
+    const days = {}; const counts = {};
+    (orders||[]).filter(o=>o.type==='Клиентский').forEach(o=>{ const t0=new Date(o.createdAt).getTime(); const t1=fgInByOrder[o.id]; if (!t1||!isFinite(t1)) return; const d=Math.max(0,(t1-t0)/(1000*60*60*24)); (o.lines||[]).forEach(l=>{ days[l.modelId]=(days[l.modelId]||0)+d; counts[l.modelId]=(counts[l.modelId]||0)+1; }); });
+    const arr = Object.keys(days).map(mid=> ({ mid, avg: counts[mid]? days[mid]/counts[mid]:0 }));
+    return arr.sort((a,b)=> a.avg - b.avg).slice(0,10);
+  }, [orders, ledger]);
+  const labels = usage.map(x=> (models.find(m=>m.id===x.mid)?.name)||'—');
+  const data = usage.map(x=> +x.avg.toFixed(1));
+  return <ChartCard type="bar" title="Среднее время производства" dataBuilder={()=>({ labels, datasets:[{ label:'Дней', data, backgroundColor:'#f59e0b' }] })} />;
+}
+
+function DashboardModelDOS({ models, jewelryStock, orders }) {
+  const modelStock = React.useMemo(()=>{
+    const map = {};
+    (jewelryStock||[]).forEach(j=>{ map[j.modelId] = (map[j.modelId]||0) + (j.qty||0); });
+    return map;
+  }, [jewelryStock]);
+  const days = 90;
+  const since = new Date(); since.setDate(since.getDate()-days);
+  const dailySales = React.useMemo(()=>{
+    const map = {};
+    (orders||[]).filter(o=>o.type==='Клиентский' && new Date(o.createdAt)>=since).forEach(o=>{
+      (o.lines||[]).forEach(l=>{ map[l.modelId] = (map[l.modelId]||0) + (l.qty||0); });
+    });
+    Object.keys(map).forEach(k=>{ map[k] = map[k]/days; });
+    return map;
+  }, [orders]);
+  const rows = Object.keys(modelStock).map(mid=>{
+    const onHand = modelStock[mid]||0;
+    const demand = dailySales[mid]||0;
+    const dos = demand>0? onHand/demand : Infinity;
+    const name = (models.find(m=>m.id===mid)?.name)||'—';
+    return { name, dos };
+  }).sort((a,b)=> a.dos - b.dos).slice(0,10);
+  const labels = rows.map(r=>r.name);
+  const data = rows.map(r=> Number.isFinite(r.dos)? Math.round(r.dos) : 999);
+  return <ChartCard type="bar" title="Дни запаса (модели)" dataBuilder={()=>({ labels, datasets:[{ label:'Дни', data, backgroundColor:'#0ea5e9' }] })} />;
+}
+
+function PopularModels({ models, orders, ledger, settings, range, onRangeChange, onlyChart=false }) {
+  const daysMap = { '1w':7, '1m':30, '3m':90, '6m':180, '12m':365 };
+  const days = daysMap[range] || 90;
+  const since = new Date(); since.setDate(since.getDate()-days);
+  const modelById = (id)=> models.find(m=>m.id===id);
+  // Продажи по моделям (по строкам заказов)
+  const sales = {};
+  (orders||[]).filter(o=> o.type==='Клиентский' && new Date(o.createdAt)>=since).forEach(o=>{
+    (o.lines||[]).forEach(l=>{ sales[l.modelId] = (sales[l.modelId]||0) + (l.qty||0); });
+  });
+  // Среднее время производства (дни) по леджеру FG_IN
+  const fgInByOrder = {};
+  (ledger||[]).filter(l=>l.type==='FG_IN' && l.refId).forEach(l=>{ fgInByOrder[l.refId] = Math.min(fgInByOrder[l.refId]||Infinity, new Date(l.date).getTime()); });
+  const prodDays = {}; const counts = {};
+  (orders||[]).filter(o=> o.type==='Клиентский' && new Date(o.createdAt)>=since).forEach(o=>{
+    const t0 = new Date(o.createdAt).getTime(); const t1 = fgInByOrder[o.id];
+    if (!t1 || !isFinite(t1)) return;
+    const d = Math.max(0, (t1 - t0) / (1000*60*60*24));
+    (o.lines||[]).forEach(l=>{
+      prodDays[l.modelId] = (prodDays[l.modelId]||0) + d;
+      counts[l.modelId] = (counts[l.modelId]||0) + 1;
+    });
+  });
+  const avgProdDays = (mid)=> counts[mid]? (prodDays[mid]/counts[mid]) : 0;
+  // Маржа за шт.
+  const perItemMargin = (m)=> {
+    const cost = modelCost(m, loadLS('nd_raw', []), settings);
+    const price = convert(m.salesPrice||0, m.salesCurrency||'KZT', settings.currency, settings.rates);
+    return Math.max(0, price - cost);
+  };
+  const rows = Object.entries(sales).map(([mid, qty])=>{
+    const m = modelById(mid);
+    return { id:mid, name:m?.name||'—', type:m?.type||'', qty, avgDays: avgProdDays(mid), margin: perItemMargin(m||{}) };
+  }).sort((a,b)=> b.qty - a.qty).slice(0,10);
+
+  const labels = rows.map(r=>r.name);
+  const values = rows.map(r=>r.qty);
+  const content = (
+    <div>
+      <div className="flex items-center justify-between mb-3">
+        <div className="text-slate-800 font-bold text-lg">Самые популярные модели</div>
+        <div className="flex items-center gap-2">
+          {[
+            {k:'1w',l:'Неделя'},{k:'1m',l:'Месяц'},{k:'3m',l:'3 мес'},{k:'6m',l:'6 мес'},{k:'12m',l:'12 мес'}
+          ].map(x=> (
+            <button key={x.k} onClick={()=>onRangeChange(x.k)} className={`px-3 py-1.5 rounded-xl text-sm font-semibold ${range===x.k? 'bg-slate-900 text-white':'bg-white border border-slate-300 text-slate-700 hover:bg-slate-50'}`}>{x.l}</button>
+          ))}
+        </div>
+      </div>
+      <ChartCard type="bar" title="По количеству продаж" dataBuilder={()=>({ labels, datasets:[{ label:'Шт', data: values, backgroundColor:'#6366f1' }] })}/>
+    </div>
+  );
+  if (onlyChart) return content;
+  return (
+    <div className="mt-6">
+      {content}
+      <div className="bg-white rounded-2xl border border-slate-200 p-4 overflow-auto mt-4">
+        <table className="min-w-full text-sm">
+          <thead><tr className="text-left text-slate-500"><th className="py-2">Модель</th><th>Тип</th><th className="text-right">Продажи</th><th className="text-right">Ср. время произв. (дн)</th><th className="text-right">Маржа (за шт)</th></tr></thead>
+          <tbody>
+            {rows.map(r=> (
+              <tr key={r.id} className="border-t border-slate-100"><td className="py-2 font-medium">{r.name}</td><td>{r.type}</td><td className="text-right">{fmt.format(r.qty)}</td><td className="text-right">{r.avgDays.toFixed(1)}</td><td className="text-right">{moneyFmt(r.margin, settings.currency)}</td></tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ------- Заказы + Канбан -------
+function OrdersBoard({ store }) {
+  const { rawItems, setRawItems, models, jewelryStock, setJewelryStock, orders, setOrders, ledger, setLedger, settings } = store;
+  const [showNew, setShowNew] = useState(false);
+  const [filter, setFilter] = useState("");
+  const [detailsId, setDetailsId] = useState(null);
+  const perms = ROLE_PERMS[settings.role] || ROLE_PERMS.admin;
+  const [dragOver, setDragOver] = useState(null);
+
+  const filtered = useMemo(()=>
+    orders.filter(o => !filter || o.type === filter)
+  ,[orders, filter]);
+
+  function addPayment(orderId, amount, method, note, currency) {
+    const payment = { id: uid(), date: todayISO(), amount: +amount, method, note, currency: currency || settings.currency };
+    setOrders(orders => orders.map(o => o.id!==orderId? o : { ...o, payments: [...(o.payments||[]), payment] }));
+    setLedger(l => [{ id: uid(), type: "PAYMENT", date: new Date().toISOString(), refId: orderId, payload:{ amount:+amount, method, note, currency: payment.currency } }, ...l]);
+  }
+
+  const createOrder = (order) => {
+    const id = uid();
+    setOrders([ { ...order, id, createdAt: new Date().toISOString(), status: "Новый", payments: order.payments || [] }, ...orders ]);
+    if (order.initialPayment && order.initialPayment>0) {
+      const method = order.initialPaymentMethod||"Kaspi";
+      const currency = settings.currency;
+      addPayment(id, order.initialPayment, method, "Аванс", currency);
+    }
+  };
+
+  const moveStatus = (id, dir) => {
+    setOrders(orders => orders.map(o => o.id!==id? o : { ...o, status: STATUSES[Math.min(STATUSES.length-1, Math.max(0, STATUSES.indexOf(o.status)+dir))] }));
+  };
+  const setStatus = (id, status) => setOrders(orders => orders.map(o => o.id!==id? o : { ...o, status }));
+
+  
+
+  const processProduction = (order) => {
+    // Списание сырья и оприходование/отгрузка
+    try {
+      order.lines.forEach(line => {
+        const model = models.find(m => m.id === line.modelId);
+        if (!model) throw new Error("Нет модели");
+        if (order.produceFromRaw) {
+          consumeRaw(rawItems, setRawItems, model.bom, line.qty);
+          addFG(jewelryStock, setJewelryStock, model.id, line.metal||model.defaultMetal, line.color||model.defaultColor, line.qty);
+          setLedger(l => [{ id: uid(), type: "RAW_OUT", date: new Date().toISOString(), refId: order.id, payload:{ model: model.name, qty: line.qty } }, ...l]);
+          setLedger(l => [{ id: uid(), type: "FG_IN", date: new Date().toISOString(), refId: order.id, payload:{ model: model.name, qty: line.qty } }, ...l]);
+        } else {
+          // отгрузить со склада украшений
+          issueFG(jewelryStock, setJewelryStock, model.id, line.metal||model.defaultMetal, line.color||model.defaultColor, line.qty);
+          setLedger(l => [{ id: uid(), type: "FG_OUT", date: new Date().toISOString(), refId: order.id, payload:{ model: model.name, qty: line.qty } }, ...l]);
+        }
+      });
+      setStatus(order.id, order.type === 'Клиентский'? 'Готово' : 'Готово');
+      showToast('Операция выполнена успешно', 'success');
+    } catch (e) {
+      showToast(e.message || 'Ошибка операции', 'error');
+    }
+  };
+
+  return (
+    <div>
+      <div className="flex flex-col md:flex-row md:items-center gap-3 mb-4">
+        <div className="flex items-center gap-2">
+          {perms.ordersCreate && <Button onClick={()=>setShowNew(true)}><Icon name="plus"/> Новый заказ</Button>}
+          <Select label="Фильтр по типу" value={filter} onChange={setFilter} options={["", "Собственный", "Клиентский"]} />
+        </div>
+        <div className="md:ml-auto text-sm text-slate-600">
+          Перетащите карточку в нужный статус. Производство/доставка изменяют запасы.
+        </div>
+      </div>
+      <div className="flex gap-4 overflow-auto pb-2">
+        {STATUSES.map(st => (
+          <div key={st} className={`min-w-[340px] bg-white rounded-2xl border p-3 transition ${dragOver===st? 'border-slate-400 ring-2 ring-slate-200':'border-slate-200'}`}
+               onDragOver={(e)=>{ e.preventDefault(); if(dragOver!==st) setDragOver(st); }}
+               onDragLeave={()=> setDragOver(null)}
+               onDrop={(e)=>{ const id=e.dataTransfer.getData('text/plain'); if(id) setStatus(id, st); setDragOver(null); }}>
+            <div className="flex items-center justify-between mb-2">
+              <div className="font-bold">{st}</div>
+              <Badge color={st==="Доставлено"? 'green': st==="Готово"? 'blue':'gray'}>{orders.filter(o=>o.status===st).length}</Badge>
+            </div>
+            <div className="space-y-3 min-h-[200px]">
+              {filtered.filter(o=>o.status===st).map(o=> (
+                <OrderCard
+                  key={o.id}
+                  order={o}
+                  models={models}
+                  settings={settings}
+                  canPay={perms.payments}
+                  canProcess={perms.process}
+                  onMoveLeft={()=>moveStatus(o.id,-1)}
+                  onMoveRight={()=>moveStatus(o.id,1)}
+                  onPayment={(amt,method,note,currency)=>addPayment(o.id,amt,method,note,currency)}
+                  onProcess={()=>processProduction(o)}
+                  onDetails={()=>setDetailsId(o.id)}
+                />
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {showNew && <NewOrderModal models={models} services={loadLS('nd_services', [])} settings={settings} onClose={()=>setShowNew(false)} onCreate={(order)=>{ createOrder(order); setShowNew(false); }} />}
+      {detailsId && (
+        <OrderDetailsModal
+          order={orders.find(o=>o.id===detailsId)}
+          models={models}
+          settings={settings}
+          ledger={ledger}
+          onClose={()=>setDetailsId(null)}
+          onCancel={()=>{ setStatus(detailsId,'Отменён'); setDetailsId(null); }}
+          onPayment={(amt,method,note,currency)=>addPayment(detailsId,amt,method,note,currency)}
+        />
+      )}
+    </div>
+  );
+}
+
+function OrderCard({ order, models, settings, canPay, canProcess, onMoveLeft, onMoveRight, onPayment, onProcess, onDetails }) {
+  const sumPayments = (order.payments||[]).reduce((s,p)=> s + convert(p.amount||0, p.currency||'KZT', settings.currency, settings.rates), 0);
+  const lineTotal = (l) => {
+    const unit = convert(l.price||0, l.currency||'KZT', settings.currency, settings.rates) * (1 - (l.discountPct||0)/100);
+    return unit * (l.qty||1);
+  };
+  const orderTotal = (order.lines||[]).reduce((s,l)=> s + lineTotal(l), 0);
+  const daysSince = Math.floor((Date.now() - new Date(order.createdAt).getTime())/(1000*60*60*24));
+  return (
+    <div className="rounded-xl border border-slate-200 p-3 bg-slate-50" draggable onDragStart={(e)=> e.dataTransfer.setData('text/plain', order.id)}>
+      <div className="flex items-center justify-between">
+        <div className="text-sm text-slate-500 flex items-center gap-2">
+          <span>{new Date(order.createdAt).toLocaleDateString('ru-RU')}</span>
+          <span className="inline-block px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-xs">{daysSince} дн.</span>
+        </div>
+        <Badge color={order.type==='Клиентский'? 'violet':'gray'}>{order.type}</Badge>
+      </div>
+      <div className="font-semibold text-slate-900 mt-1">{order.customer||'—'}</div>
+      <div className="mt-2 text-sm">
+        {order.lines.slice(0,1).map(l=> {
+          const m = models.find(mm=>mm.id===l.modelId);
+          return (
+            <div key={l.id} className="flex items-center justify-between py-1 border-t border-slate-200">
+              <div>
+                <div className="font-medium">{m?.name} · {l.metal||m?.defaultMetal}/{l.color||m?.defaultColor}</div>
+                <div className="text-slate-500">{m?.type} · сумма заказа: {moneyFmt(orderTotal, settings.currency)}</div>
+              </div>
+              <Button variant="outline" onClick={onDetails}>Подробнее</Button>
+            </div>
+          );
+        })}
+      </div>
+      {order.type==='Клиентский' && (
+        <div className="mt-2 text-sm flex items-center justify-between">
+          <div className="text-slate-600">Сумма заказа: <span className="font-semibold">{moneyFmt(orderTotal, settings.currency)}</span> · Оплачено: <span className="font-semibold">{moneyFmt(sumPayments, settings.currency)}</span></div>
+          {canPay && (
+            <Button variant="outline" onClick={()=>{
+              const amt = prompt(`Сумма оплаты (${settings.currency})`, '100000');
+              if (!amt) return; const cur = prompt('Валюта платежа (KZT/USD/EUR/...)', settings.currency)||settings.currency; const method = prompt('Метод (Kaspi/Карта/Наличными)', 'Kaspi')||'Kaspi'; const note = prompt('Комментарий','Оплата от клиента')||''; onPayment(+amt, method, note, cur);
+            }}><Icon name="money"/> Оплата</Button>
+          )}
+        </div>
+      )}
+      <div className="flex items-center gap-2 mt-3">
+        <Button variant="ghost" onClick={onMoveLeft}><Icon name="arrowL"/>Назад</Button>
+        <Button variant="ghost" onClick={onMoveRight}>Вперёд<Icon name="arrowR"/></Button>
+        <div className="ml-auto" />
+        {canProcess && <Button variant="success" onClick={onProcess}><Icon name="check"/> Провести</Button>}
+      </div>
+    </div>
+  );
+}
+
+function OrderDetailsModal({ order, models, settings, ledger, onClose, onCancel, onPayment }) {
+  if (!order) return null;
+  const sumPayments = (order.payments||[]).reduce((s,p)=> s + convert(p.amount||0, p.currency||'KZT', settings.currency, settings.rates), 0);
+  const lineTotal = (l) => convert(l.price||0, l.currency||'KZT', settings.currency, settings.rates) * (1 - (l.discountPct||0)/100) * (l.qty||1);
+  const orderTotal = (order.lines||[]).reduce((s,l)=> s + lineTotal(l), 0);
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 overflow-auto p-4">
+      <div className="w-full max-w-3xl bg-white rounded-2xl p-4 md:p-6 border border-slate-200 mx-auto my-8 max-h-[85vh] overflow-auto">
+        <div className="flex items-center justify-between mb-3"><div className="text-lg font-bold">Детали заказа</div><button className="p-2" onClick={onClose}><Icon name="x" className="w-5 h-5"/></button></div>
+        <div className="text-sm text-slate-600 mb-2">Дата: {new Date(order.createdAt).toLocaleString('ru-RU')} · Тип: {order.type} · Клиент: {order.customer||'—'}</div>
+        {order.note && <div className="text-sm text-slate-600 mb-3">Комментарий: {order.note}</div>}
+        <Section title="Позиции">
+          <table className="w-full text-sm">
+            <thead><tr className="text-left text-slate-500"><th className="py-2">Модель</th><th>Параметры</th><th className="text-right">Кол-во</th><th className="text-right">Сумма</th></tr></thead>
+            <tbody>
+              {(order.lines||[]).map(l=>{ const m=models.find(mm=>mm.id===l.modelId); return (
+                <tr key={l.id} className="border-t border-slate-100">
+                  <td className="py-2 font-medium">{m?.name}</td>
+                  <td className="text-slate-600">{m?.type} · {l.metal||m?.defaultMetal}/{l.color||m?.defaultColor}{m?.type==='Кольцо' && l.size? ` · размер ${l.size}`:''}{l.engravingEnabled && l.engraving? ` · гравировка: “${l.engraving}”`:''}</td>
+                  <td className="text-right">{fmt.format(l.qty)} шт</td>
+                  <td className="text-right">{moneyFmt(lineTotal(l), settings.currency)}</td>
+                </tr>
+              ); })}
+            </tbody>
+          </table>
+          <div className="text-right mt-3 text-sm">Сумма заказа: <span className="font-semibold">{moneyFmt(orderTotal, settings.currency)}</span></div>
+        </Section>
+        <Section title="Платежи">
+          <div className="flex items-center justify-between mb-2"><div className="text-sm text-slate-600">Оплачено: <span className="font-semibold">{moneyFmt(sumPayments, settings.currency)}</span></div>{<Button variant="outline" onClick={()=>{ const amt=prompt(`Сумма оплаты (${settings.currency})`,'100000'); if(!amt) return; const cur=prompt('Валюта платежа (KZT/USD/EUR/...)', settings.currency)||settings.currency; const method=prompt('Метод (Kaspi/Карта/Наличными)', 'Kaspi')||'Kaspi'; const note=prompt('Комментарий','Оплата от клиента')||''; onPayment(+amt, method, note, cur); }}>Добавить оплату</Button>}</div>
+          <table className="w-full text-sm">
+            <thead><tr className="text-left text-slate-500"><th className="py-2">Дата</th><th>Сумма</th><th>Метод</th><th>Комментарий</th></tr></thead>
+            <tbody>
+              {(order.payments||[]).map(p => (
+                <tr key={p.id} className="border-t border-slate-100">
+                  <td className="py-2">{new Date(p.date).toLocaleDateString('ru-RU')}</td>
+                  <td>{moneyFmt(convert(p.amount||0, p.currency||'KZT', settings.currency, settings.rates), settings.currency)}</td>
+                  <td>{p.method}</td>
+                  <td className="text-slate-600">{p.note||''}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Section>
+        <div className="flex items-center justify-between">
+          <Button variant="outline" onClick={onCancel}>Отменить заказ</Button>
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" onClick={onClose}>Закрыть</Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function NewOrderModal({ models, services, settings, onClose, onCreate }) {
+  const [type, setType] = useState("Клиентский");
+  const [customer, setCustomer] = useState("");
+  const [produceFromRaw, setProduceFromRaw] = useState(true);
+  const [lines, setLines] = useState([]);
+  const [note, setNote] = useState("");
+
+  const addLine = () => {
+    const m = models[0];
+    const metals = (m?.variants && m.variants.length)? Array.from(new Set(m.variants.map(v=>v.metal))) : (m?.allowedMetals && m.allowedMetals.length? m.allowedMetals : ['Золото','Серебро']);
+    const metal = m?.defaultMetal||metals[0]||'Золото';
+    const v = getVariant(m, metal, m?.defaultColor||'Белый');
+    const price = v?.salesPrice ?? m?.salesPrice ?? 0;
+    const currency = v?.salesCurrency ?? m?.salesCurrency ?? 'KZT';
+    setLines([...lines, { id: uid(), modelId: m?.id, metal, color: '', qty: 1, price, currency, discountPct: 0, engravingEnabled:false, engraving: '', size: '' }]);
+  };
+  const updLine = (id, patch) => setLines(lines.map(l => {
+    if (l.id!==id) return l;
+    const next = { ...l, ...patch };
+    // если поменяли модель — подставить цену продажи и валюту
+    if (patch.modelId) {
+      const m = models.find(mm=>mm.id===patch.modelId);
+      const metals = (m?.variants && m.variants.length)? Array.from(new Set(m.variants.map(v=>v.metal))) : (m?.allowedMetals && m.allowedMetals.length? m.allowedMetals : ['Золото','Серебро']);
+      next.metal = m?.defaultMetal || metals[0] || next.metal;
+      next.color = m?.defaultColor||next.color;
+      const v = getVariant(m, next.metal, next.color);
+      next.price = v?.salesPrice ?? m?.salesPrice ?? 0;
+      next.currency = v?.salesCurrency ?? m?.salesCurrency ?? 'KZT';
+    }
+    if (patch.metal) {
+      const m = models.find(mm=>mm.id===next.modelId);
+      const v = getVariant(m, patch.metal, next.color);
+      next.price = v?.salesPrice ?? m?.salesPrice ?? 0;
+      next.currency = v?.salesCurrency ?? m?.salesCurrency ?? 'KZT';
+    }
+    return next;
+  }));
+  const delLine = (id) => setLines(lines.filter(l=>l.id!==id));
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 overflow-auto p-4">
+      <div className="w-full max-w-2xl bg-white rounded-2xl p-4 md:p-6 border border-slate-200 mx-auto my-8 max-h-[85vh] overflow-auto">
+        <div className="flex items-center justify-between mb-3">
+          <div className="text-lg font-bold">Новый заказ</div>
+          <button className="p-2" onClick={onClose}><Icon name="x" className="w-5 h-5"/></button>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <Select label="Тип заказа" value={type} onChange={setType} options={["Клиентский","Собственный"]} />
+          <Input label="Клиент (ФИО/ник)" value={customer} onChange={e=>setCustomer(e.target.value)} placeholder="Для собственных можно оставить пустым" />
+          <label className="block text-sm mb-3">
+            <span className="block text-slate-600 mb-1">Производить из сырья?</span>
+            <select value={produceFromRaw? '1':'0'} onChange={e=>setProduceFromRaw(e.target.value==='1')} className="w-full rounded-xl border border-slate-300 px-3 py-2">
+              <option value="1">Да — списать сырьё и оприходовать</option>
+              <option value="0">Нет — отгрузить со склада украшений</option>
+            </select>
+          </label>
+        </div>
+        <label className="block text-sm mb-3">
+          <span className="block text-slate-600 mb-1">Комментарий к заказу</span>
+          <textarea value={note} onChange={e=>setNote(e.target.value)} rows={2} className="w-full rounded-xl border border-slate-300 px-3 py-2" placeholder="Дополнительная информация, пожелания, контакты"/>
+        </label>
+
+        <Section title="Позиции">
+          <div className="space-y-3">
+            {lines.map((l, idx)=> {
+              const m = models.find(mm=>mm.id===l.modelId) || models[0];
+              const unitDisplay = moneyFmt(convert(l.price||0, l.currency||'KZT', settings.currency, settings.rates), settings.currency);
+              const unitFinal = moneyFmt(convert((l.price||0)*(1-(l.discountPct||0)/100), l.currency||'KZT', settings.currency, settings.rates), settings.currency);
+              const svcPrice = (name)=> {
+                const s=(services||[]).find(x=>x.name.toLowerCase().includes(name.toLowerCase()));
+                return s? convert(s.price||0, s.currency||'KZT', settings.currency, settings.rates) : 0;
+              };
+              const extraCost = (l.engravingEnabled? svcPrice('Гравировка'):0) + (l.resize? svcPrice('Изменение размера'):0) + (l.replating? svcPrice('Восстановление покрытия'):0);
+              return (
+                <div key={l.id} className="grid grid-cols-1 md:grid-cols-12 gap-2 items-end">
+                  <label className="md:col-span-4 text-sm">
+                    <span className="block text-slate-600 mb-1">Модель</span>
+                    <select value={l.modelId} onChange={e=>updLine(l.id,{ modelId:e.target.value })} className="w-full rounded-xl border border-slate-300 px-3 py-2">
+                      {models.map(m=> <option key={m.id} value={m.id}>{m.name} · {m.type}</option>)}
+                    </select>
+                  </label>
+                  <label className="md:col-span-3 text-sm">
+                    <span className="block text-slate-600 mb-1">Металл</span>
+                    <select value={l.metal} onChange={e=>updLine(l.id,{ metal:e.target.value })} className="w-full rounded-xl border border-slate-300 px-3 py-2">
+                      {((m?.variants && m.variants.length)? Array.from(new Set(m.variants.map(v=>v.metal))) : (m?.allowedMetals && m.allowedMetals.length? m.allowedMetals : ['Золото','Серебро'])).map(v=> <option key={v} value={v}>{v}</option>)}
+                    </select>
+                  </label>
+                  <label className="md:col-span-3 text-sm">
+                    <span className="block text-slate-600 mb-1">Цвет</span>
+                    <select value={l.color} onChange={e=>updLine(l.id,{ color:e.target.value })} className="w-full rounded-xl border border-slate-300 px-3 py-2">
+                      <option value="">— выберите —</option>
+                      {['Белый','Жёлтый','Красный'].map(v=> <option key={v} value={v}>{v}</option>)}
+                    </select>
+                  </label>
+                  <label className="md:col-span-1 text-sm">
+                    <span className="block text-slate-600 mb-1">Кол-во</span>
+                    <input type="number" min={1} value={l.qty} onChange={e=>updLine(l.id,{ qty: Math.max(1, +e.target.value) })} className="w-full rounded-xl border border-slate-300 px-3 py-2"/>
+                  </label>
+                  {m?.type==='Кольцо' && (
+                    <label className="md:col-span-2 text-sm">
+                      <span className="block text-slate-600 mb-1">Размер (кольцо)</span>
+                      <input value={l.size||''} onChange={e=>updLine(l.id,{ size:e.target.value })} className="w-full rounded-xl border border-slate-300 px-3 py-2" placeholder="Напр. 17.5"/>
+                    </label>
+                  )}
+                  <div className="md:col-span-4 text-xs text-slate-600 grid grid-cols-1 gap-2">
+                    <label className="inline-flex items-center gap-2">
+                      <input type="checkbox" checked={!!l.engravingEnabled} onChange={e=>updLine(l.id,{ engravingEnabled:e.target.checked })}/>
+                      <span>Гравировка</span>
+                    </label>
+                    {l.engravingEnabled && <input value={l.engraving||''} onChange={e=>updLine(l.id,{ engraving:e.target.value })} className="w-full rounded-xl border border-slate-300 px-3 py-2" placeholder="Текст гравировки"/>}
+                    <label className="inline-flex items-center gap-2"><input type="checkbox" checked={!!l.resize} onChange={e=>updLine(l.id,{ resize:e.target.checked })}/><span>Изменение размера</span></label>
+                    <label className="inline-flex items-center gap-2"><input type="checkbox" checked={!!l.replating} onChange={e=>updLine(l.id,{ replating:e.target.checked })}/><span>Восстановление покрытия</span></label>
+                  </div>
+                  <div className="md:col-span-3 text-xs text-slate-600">
+                    <div>Цена за шт: <span className="font-semibold">{unitDisplay}</span></div>
+                    <div>Скидка: <input type="number" min={0} max={100} value={l.discountPct||0} onChange={e=>updLine(l.id,{ discountPct:+e.target.value })} className="w-20 ml-1 rounded-xl border border-slate-300 px-2 py-1"/>%</div>
+                    <div>Итого/шт: <span className="font-semibold">{unitFinal}</span></div>
+                  </div>
+                  <div className="md:col-span-1 flex items-center gap-2 justify-end">
+                    <Button variant="danger" onClick={()=>delLine(l.id)}><Icon name="trash"/></Button>
+                  </div>
+                  <div className="md:col-span-12 text-xs text-slate-500 -mt-1">
+                    {(() => {
+                      const color = l.color || m?.defaultColor;
+                      const baseCost = modelCost(m, window.__rawItemsForCalc || [], settings, l.metal||m?.defaultMetal, color);
+                      const platingAuto = (l.metal==='Серебро' && color && color!=='Белый') ? servicePrice('Покрытие золотом', settings) : 0;
+                      const total = baseCost + extraCost; // extraCost уже включает услуги
+                      return `Себестоимость (1 шт): ${moneyFmt(total, settings.currency)}`;
+                    })()}
+                    {l.metal==='Серебро' && l.color && l.color!=='Белый' && <span className="ml-2 text-amber-600">+ Авто: покрытие золотом</span>}
+                  </div>
+                </div>
+              );
+            })}
+            <Button variant="outline" onClick={addLine}><Icon name="plus"/> Добавить позицию</Button>
+          </div>
+        </Section>
+
+        <div className="flex items-center justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>Отмена</Button>
+          <Button onClick={()=>{
+            if (lines.length===0) { alert('Добавьте хотя бы одну позицию'); return; }
+            if (lines.some(l => !l.color)) { alert('Укажите цвет для всех позиций заказа'); return; }
+            const newOrder = { type, customer: customer||undefined, lines, produceFromRaw, note };
+            onCreate(newOrder);
+          }}><Icon name="check"/> Создать</Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ------- Склад сырья -------
+function RawWarehouse({ rawItems, setRawItems, settings, setSettings }) {
+  const [q, setQ] = useState("");
+  const [showNew, setShowNew] = useState(false);
+  const [selectedId, setSelectedId] = useState(null);
+
+  useEffect(()=>{ window.__rawItemsForCalc = rawItems; }, [rawItems]);
+
+  const filtered = rawItems.filter(r => r.name.toLowerCase().includes(q.toLowerCase()) || (r.category||'').toLowerCase().includes(q.toLowerCase()));
+
+  const adjust = (id, delta) => setRawItems(items => items.map(r => r.id!==id? r : { ...r, stockQty: Math.max(0, +(r.stockQty + delta).toFixed(4)) }));
+
+  const update = (id, patch) => setRawItems(items => items.map(r => r.id!==id? r : { ...r, ...patch }));
+
+  const remove = (id) => setRawItems(items => items.filter(r => r.id!==id));
+
+  const perms = ROLE_PERMS[settings.role] || ROLE_PERMS.admin;
+  const usageByDay = useMemo(()=> computeRawUsageByDay(loadLS('nd_ledger', []), loadLS('nd_models', [])), []);
+  const enrich = (r) => {
+    const u30 = avgDailyUsage(r.id, usageByDay, 30);
+    const rop = reorderPoint(r, u30);
+    const days = daysToStockout(r, u30);
+    return { u30, rop, days };
+  };
+  return (
+    <div>
+      <div className="flex flex-col md:flex-row md:items-center gap-3 mb-4">
+        <div className="relative">
+          <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Поиск по названию/категории" className="w-72 rounded-xl border border-slate-300 pl-9 pr-3 py-2"/>
+          <span className="absolute left-2.5 top-2.5 text-slate-400"><Icon name="search"/></span>
+        </div>
+        {perms.rawEdit && (<Button onClick={()=>setShowNew(true)}><Icon name="plus"/> Новая позиция сырья</Button>)}
+        <div className="text-xs text-slate-500">Двойной клик по строке — детали и действия</div>
+      </div>
+
+      <div className="overflow-auto bg-white rounded-2xl border border-slate-200">
+        <table className="min-w-full text-sm table-fixed">
+          <thead>
+            <tr className="text-left text-slate-500">
+              <th className="py-2 px-3 w-72">Наименование</th>
+              <th className="px-3 w-28">Категория</th>
+              <th className="px-3 w-16">Ед.</th>
+              <th className="px-3 text-right w-32">Цена</th>
+              <th className="px-3 text-right w-32">Остаток</th>
+              <th className="px-3 text-right w-32">Сумма</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map(r=> (
+              <tr key={r.id} className="border-t border-slate-100 hover:bg-slate-50 cursor-pointer" onDoubleClick={()=>setSelectedId(r.id)} title="Двойной клик — детали">
+                <td className="py-2 px-3 font-medium break-words">{r.name}</td>
+                <td className="px-3 whitespace-nowrap">{r.category}</td>
+                <td className="px-3 whitespace-nowrap">{r.unit}</td>
+                <td className="px-3 text-right whitespace-nowrap">{moneyDisplay(r.costPerUnit, r.currency||'KZT', settings)} <span className="text-slate-400 text-xs">({r.currency||'KZT'})</span></td>
+                <td className="px-3 text-right whitespace-nowrap">{fmt.format(r.stockQty)} {r.unit}</td>
+                <td className="px-3 text-right whitespace-nowrap">{moneyDisplay(r.costPerUnit*r.stockQty, r.currency||'KZT', settings)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {showNew && <NewRawModal settings={settings} onClose={()=>setShowNew(false)} onCreate={(item)=>{ setRawItems([...rawItems, item]); setShowNew(false); }} />}
+      {selectedId && <RawItemModal raw={rawItems.find(x=>x.id===selectedId)} suppliers={loadLS('nd_suppliers', [])} settings={settings} onClose={()=>setSelectedId(null)} onUpdate={(patch)=> setRawItems(items => items.map(r => r.id!==selectedId? r : { ...r, ...patch }))} onAdjust={(delta)=> setRawItems(items => items.map(r => r.id!==selectedId? r : { ...r, stockQty: Math.max(0, +(r.stockQty + delta).toFixed(4)) }))} onDelete={()=>{ if(confirm('Удалить позицию сырья?')) setRawItems(items => items.filter(r=>r.id!==selectedId)); setSelectedId(null); }} />}
+    </div>
+  );
+}
+
+function NewRawModal({ settings, onClose, onCreate }) {
+  const [name, setName] = useState("");
+  const [category, setCategory] = useState("Бриллиант");
+  const [unit, setUnit] = useState("шт");
+  const [carat, setCarat] = useState(0.3);
+  const [metal, setMetal] = useState("Золото");
+  const [color, setColor] = useState("Белый");
+  const [cost, setCost] = useState(0);
+  const [qty, setQty] = useState(0);
+  const [currency, setCurrency] = useState(settings?.currency || 'KZT');
+  const suppliers = loadLS('nd_suppliers', []);
+  const [supplierId, setSupplierId] = useState(suppliers[0]?.id || '');
+  const [safetyStock, setSafetyStock] = useState(0);
+  const [leadTimeDays, setLeadTimeDays] = useState(7);
+
+  useEffect(()=>{
+    if (!name) {
+      if (category==='Бриллиант') setName(`Бриллиант ${carat} ct`);
+      if (category==='Металл') setName(`${metal} ${color}`);
+      if (category==='Работа') setName(`Работа цеха`);
+    }
+  }, [category, carat, metal, color]);
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 overflow-auto p-4">
+      <div className="w-full max-w-xl bg-white rounded-2xl p-4 md:p-6 border border-slate-200 mx-auto my-8 max-h-[85vh] overflow-auto">
+        <div className="flex items-center justify-between mb-3"><div className="text-lg font-bold">Новая позиция сырья</div><button className="p-2" onClick={onClose}><Icon name="x" className="w-5 h-5"/></button></div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <Select label="Категория" value={category} onChange={(v)=>{ setCategory(v); setUnit(v==='Металл'? 'г' : v==='Работа'? 'ед':'шт'); }} options={["Бриллиант","Металл","Работа"]} />
+          <Input label="Наименование" value={name} onChange={e=>setName(e.target.value)} placeholder="Автогенерируется, можно изменить"/>
+          {category==='Бриллиант' && <Input label="Карат" type="number" step="0.01" value={carat} onChange={e=>setCarat(+e.target.value)}/>} 
+          {category==='Металл' && <Select label="Металл" value={metal} onChange={setMetal} options={["Золото","Серебро"]} />} 
+          {category==='Металл' && <Select label="Цвет" value={color} onChange={setColor} options={["Белый","Жёлтый","Красный"]} />} 
+          <Select label="Единица" value={unit} onChange={setUnit} options={["шт","г","ед"]} />
+          <div className="grid grid-cols-2 gap-3">
+            <Select label="Валюта" value={currency} onChange={setCurrency} options={Object.keys(settings?.rates||{KZT:1})} />
+            <Input label={`Цена за ед. (${currency})`} type="number" value={cost} onChange={e=>setCost(+e.target.value)} />
+          </div>
+          <Input label="Начальный остаток" type="number" value={qty} onChange={e=>setQty(+e.target.value)} />
+          <label className="block text-sm mb-3">
+            <span className="block text-slate-600 mb-1">Поставщик</span>
+            <select value={supplierId} onChange={e=>setSupplierId(e.target.value)} className="w-full rounded-xl border border-slate-300 px-3 py-2">
+              {suppliers.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+          </label>
+          <div className="grid grid-cols-2 gap-3">
+            <Input label="Безопасный запас" type="number" value={safetyStock} onChange={e=>setSafetyStock(+e.target.value)} />
+            <Input label="Lead time (дней)" type="number" value={leadTimeDays} onChange={e=>setLeadTimeDays(+e.target.value)} />
+          </div>
+        </div>
+        <div className="flex items-center justify-end gap-2 mt-3">
+          <Button variant="ghost" onClick={onClose}>Отмена</Button>
+          <Button onClick={()=>{
+            const item = { id: uid(), name, category, unit, carat: category==='Бриллиант'? carat: undefined, metal: category==='Металл'? metal: undefined, color: category==='Металл'? color: undefined, costPerUnit: cost||0, currency, stockQty: qty||0, supplierId: supplierId||null, safetyStock, leadTimeDays, holdingCostPct:0.2, orderCost:0, priceHistory:[{ date:new Date().toISOString(), price: cost||0, currency }], priceBreaks: [] };
+            onCreate(item);
+          }}><Icon name="check"/> Добавить</Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RawItemModal({ raw, suppliers, settings, onClose, onUpdate, onAdjust, onDelete }) {
+  if (!raw) return null;
+  const perms = ROLE_PERMS[settings.role] || ROLE_PERMS.admin;
+  const [edit, setEdit] = useState(false);
+
+  // Local editable fields
+  const [name, setName] = useState(raw.name||'');
+  const [category, setCategory] = useState(raw.category||'Бриллиант');
+  const [unit, setUnit] = useState(raw.unit||'шт');
+  const [carat, setCarat] = useState(raw.carat||0);
+  const [metal, setMetal] = useState(raw.metal||'Золото');
+  const [color, setColor] = useState(raw.color||'Белый');
+  const [supplierId, setSupplierId] = useState(raw.supplierId||'');
+  const [safetyStock, setSafetyStock] = useState(raw.safetyStock||0);
+  const [leadTimeDays, setLeadTimeDays] = useState(raw.leadTimeDays||7);
+  const [holdingCostPct, setHoldingCostPct] = useState(raw.holdingCostPct||0.2);
+  const [orderCost, setOrderCost] = useState(raw.orderCost||0);
+  const [price, setPrice] = useState(raw.costPerUnit||0);
+  const [cur, setCur] = useState(raw.currency||'KZT');
+  const [qtyDelta, setQtyDelta] = useState(1);
+
+  useEffect(()=>{
+    // Reset local state when switching items
+    setName(raw.name||'');
+    setCategory(raw.category||'Бриллиант');
+    setUnit(raw.unit||'шт');
+    setCarat(raw.carat||0);
+    setMetal(raw.metal||'Золото');
+    setColor(raw.color||'Белый');
+    setSupplierId(raw.supplierId||'');
+    setSafetyStock(raw.safetyStock||0);
+    setLeadTimeDays(raw.leadTimeDays||7);
+    setHoldingCostPct(raw.holdingCostPct||0.2);
+    setOrderCost(raw.orderCost||0);
+    setPrice(raw.costPerUnit||0);
+    setCur(raw.currency||'KZT');
+    setQtyDelta(1);
+    setEdit(false);
+  }, [raw?.id]);
+
+  const supName = suppliers.find(s=>s.id===supplierId)?.name || '—';
+
+  const saveAll = () => {
+    const patch = {
+      name,
+      category,
+      unit,
+      supplierId: supplierId || null,
+      safetyStock: +safetyStock || 0,
+      leadTimeDays: +leadTimeDays || 0,
+      holdingCostPct: +holdingCostPct || 0,
+      orderCost: +orderCost || 0,
+    };
+    if (category === 'Бриллиант') {
+      patch.carat = +carat || 0;
+      patch.metal = undefined;
+      patch.color = undefined;
+    } else if (category === 'Металл') {
+      patch.metal = metal;
+      patch.color = color;
+      patch.carat = undefined;
+    } else {
+      // keep as-is for any other categories
+    }
+    // Price & currency: update and append to history if changed
+    const priceChanged = (+price||0) !== (+raw.costPerUnit||0) || (cur !== (raw.currency||'KZT'));
+    patch.costPerUnit = +price || 0;
+    patch.currency = cur;
+    if (priceChanged) {
+      patch.priceHistory = [...(raw.priceHistory||[]), { date:new Date().toISOString(), price:+price||0, currency:cur }];
+    }
+    onUpdate(patch);
+    setEdit(false);
+    showToast('Характеристики сырья обновлены', 'success');
+  };
+
+  const savePriceOnly = () => {
+    onUpdate({ costPerUnit: +price||0, currency: cur, priceHistory:[...(raw.priceHistory||[]), { date:new Date().toISOString(), price:+price||0, currency:cur }] });
+    showToast('Цена сырья сохранена', 'success');
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 overflow-auto p-4">
+      <div className="w-full max-w-2xl bg-white rounded-2xl p-4 md:p-6 border border-slate-200 mx-auto my-8 max-h-[85vh] overflow-auto">
+        <div className="flex items-center justify-between mb-3">
+          <div className="text-lg font-bold truncate" title={name}>{edit ? 'Редактирование: ' : ''}{name}</div>
+          <div className="flex items-center gap-2">
+            {perms.rawEdit && !edit && <Button variant="outline" onClick={()=>setEdit(true)}><Icon name="edit"/> Редактировать</Button>}
+            {perms.rawEdit && edit && (
+              <>
+                <Button variant="ghost" onClick={()=>{ // cancel
+                  setName(raw.name||''); setCategory(raw.category||'Бриллиант'); setUnit(raw.unit||'шт'); setCarat(raw.carat||0); setMetal(raw.metal||'Золото'); setColor(raw.color||'Белый'); setSupplierId(raw.supplierId||''); setSafetyStock(raw.safetyStock||0); setLeadTimeDays(raw.leadTimeDays||7); setHoldingCostPct(raw.holdingCostPct||0.2); setOrderCost(raw.orderCost||0); setPrice(raw.costPerUnit||0); setCur(raw.currency||'KZT'); setEdit(false);
+                }}>Отмена</Button>
+                <Button onClick={saveAll}><Icon name="check"/> Сохранить</Button>
+              </>
+            )}
+            <button className="p-2" onClick={onClose}><Icon name="x" className="w-5 h-5"/></button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="md:col-span-2">
+            {edit ? (
+              <Input label="Наименование" value={name} onChange={e=>setName(e.target.value)} />
+            ) : (
+              <div className="text-sm">
+                <div className="text-slate-500">Наименование</div>
+                <div className="font-semibold break-words">{raw.name}</div>
+              </div>
+            )}
+          </div>
+
+          <div>
+            {edit ? (
+              <Select label="Категория" value={category} onChange={(v)=>{ setCategory(v); if(v==='Металл' && unit==='шт') setUnit('г'); if(v==='Бриллиант' && unit==='г') setUnit('шт'); }} options={["Бриллиант","Металл"]} />
+            ) : (
+              <div className="text-sm"><div className="text-slate-500">Категория</div><div className="font-semibold">{raw.category}</div></div>
+            )}
+          </div>
+
+          <div>
+            {edit ? (
+              <Select label="Единица" value={unit} onChange={setUnit} options={["шт","г","ед"]} />
+            ) : (
+              <div className="text-sm"><div className="text-slate-500">Ед.</div><div className="font-semibold">{raw.unit}</div></div>
+            )}
+          </div>
+
+          {category==='Бриллиант' && (
+            <div>
+              {edit ? (
+                <Input label="Карат" type="number" step="0.01" value={carat} onChange={e=>setCarat(+e.target.value)} />
+              ) : (
+                <div className="text-sm"><div className="text-slate-500">Карат</div><div className="font-semibold">{raw.carat}</div></div>
+              )}
+            </div>
+          )}
+
+          {category==='Металл' && (
+            <>
+              <div>
+                {edit ? (
+                  <Select label="Металл" value={metal} onChange={setMetal} options={["Золото","Серебро"]} />
+                ) : (
+                  <div className="text-sm"><div className="text-slate-500">Металл</div><div className="font-semibold">{raw.metal||'—'}</div></div>
+                )}
+              </div>
+              <div>
+                {edit ? (
+                  <Select label="Цвет" value={color} onChange={setColor} options={["Белый","Жёлтый","Красный"]} />
+                ) : (
+                  <div className="text-sm"><div className="text-slate-500">Цвет</div><div className="font-semibold">{raw.color||'—'}</div></div>
+                )}
+              </div>
+            </>
+          )}
+
+          <div>
+            {edit ? (
+              <label className="block text-sm mb-3">
+                <span className="block text-slate-600 mb-1">Поставщик</span>
+                <select value={supplierId} onChange={e=>setSupplierId(e.target.value)} className="w-full rounded-xl border border-slate-300 px-3 py-2">
+                  <option value="">—</option>
+                  {suppliers.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                </select>
+              </label>
+            ) : (
+              <div className="text-sm"><div className="text-slate-500">Поставщик</div><div className="font-semibold">{supName}</div></div>
+            )}
+          </div>
+
+          <div className="text-sm"><div className="text-slate-500">Остаток</div><div className="font-semibold">{fmt.format(raw.stockQty)} {raw.unit}</div></div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+          <div className="grid grid-cols-2 gap-3">
+            <Select label="Валюта" value={cur} onChange={setCur} options={Object.keys(settings.rates)} />
+            <Input label={`Цена за ед. (${cur})`} type="number" value={price} onChange={e=>setPrice(+e.target.value)} />
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            <Input label="Изменить кол-во" type="number" value={qtyDelta} onChange={e=>setQtyDelta(+e.target.value||0)} />
+            <Button variant="outline" onClick={()=> onAdjust(Math.abs(qtyDelta))}>+ Приход</Button>
+            <Button variant="outline" onClick={()=> onAdjust(-Math.abs(qtyDelta))}>− Расход</Button>
+          </div>
+        </div>
+
+        {edit && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+            <Input label="Безопасный запас" type="number" value={safetyStock} onChange={e=>setSafetyStock(+e.target.value)} />
+            <Input label="Lead time (дней)" type="number" value={leadTimeDays} onChange={e=>setLeadTimeDays(+e.target.value)} />
+            <Input label="Стоимость заказа (фикс)" type="number" value={orderCost} onChange={e=>setOrderCost(+e.target.value)} />
+            <Input label="Удержание (% год)" type="number" value={holdingCostPct} onChange={e=>setHoldingCostPct(+e.target.value)} />
+          </div>
+        )}
+
+        <div className="flex items-center justify-between mt-4">
+          {perms.rawEdit ? (
+            <Button variant="danger" onClick={onDelete}><Icon name="trash"/> Удалить</Button>
+          ) : <span />}
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" onClick={onClose}>Закрыть</Button>
+            {!edit && <Button onClick={savePriceOnly}><Icon name="check"/> Сохранить цену</Button>}
+            {edit && <Button onClick={saveAll}><Icon name="check"/> Сохранить изменения</Button>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ------- Склад украшений (готовая продукция) -------
+function FGWarehouse({ models, jewelryStock, setJewelryStock, settings }) {
+  const [q, setQ] = useState("");
+  const filtered = jewelryStock.filter(j => { const m=models.find(mm=>mm.id===j.modelId); return !q || (m?.name||'').toLowerCase().includes(q.toLowerCase()); });
+  const perms = ROLE_PERMS[settings.role] || ROLE_PERMS.admin;
+  const adjust = (id, delta) => setJewelryStock(items => items.map(j => j.id!==id? j : { ...j, qty: Math.max(0, j.qty + delta) }));
+  const remove = (id) => setJewelryStock(items => items.filter(j=>j.id!==id));
+
+  const Card = ({ j }) => {
+    const m = models.find(mm=>mm.id===j.modelId);
+    const v = getVariant(m, j.metal||m?.defaultMetal, j.color||m?.defaultColor);
+    const price = convert((v?.salesPrice ?? m?.salesPrice ?? 0), (v?.salesCurrency ?? m?.salesCurrency ?? 'KZT'), settings.currency, settings.rates);
+    const cost = modelCost(m, loadLS('nd_raw', []), settings, j.metal||m?.defaultMetal, j.color||m?.defaultColor);
+    const margin = Math.max(0, price - cost);
+    return (
+      <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
+        <div className="p-3">
+          <div className="w-full aspect-[3/2] bg-slate-100 rounded-xl overflow-hidden grid place-items-center">
+            {(() => { const photo = getVariantPhoto(m, v, j.color||m?.defaultColor); return photo? <img src={photo} className="w-full h-full object-cover"/> : <span className="text-slate-400 text-xs">Нет фото</span>; })()}
+          </div>
+          <div className="mt-2">
+            <div className="font-semibold">{m?.name}</div>
+            <div className="text-slate-500 text-xs">{m?.type} · {j.metal}/{j.color} · {fmt.format(j.qty)} шт</div>
+            <div className="mt-1 text-sm">Цена продажи: <span className="font-semibold">{moneyFmt(price, settings.currency)}</span></div>
+            <div className="text-xs text-slate-600 flex items-center justify-between">
+              <span>Себестоимость: {moneyFmt(cost, settings.currency)}</span>
+              <span>Маржа: {moneyFmt(margin, settings.currency)}</span>
+            </div>
+            <div className="mt-2 text-right">
+              <Button variant="outline" onClick={()=>{
+                const action = prompt('Действие: + для прихода, - для расхода, del для удаления','+');
+                if (action==='+') { const v=+prompt('Приход количества','1'); if(v) adjust(j.id, v); }
+                else if (action==='-') { const v=+prompt('Расход количества','1'); if(v) adjust(j.id, -v); }
+                else if (action==='del') { if(confirm('Удалить позицию?')) remove(j.id); }
+              }}>Изменить детали</Button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-4">
+        <div className="relative">
+          <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Поиск по модели" className="w-72 rounded-xl border border-slate-300 pl-9 pr-3 py-2"/>
+          <span className="absolute left-2.5 top-2.5 text-slate-400"><Icon name="search"/></span>
+        </div>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {filtered.map(j => <Card key={j.id} j={j} />)}
+      </div>
+    </div>
+  );
+}
+
+// ------- Доступно к производству -------
+function Capacity({ models, rawItems, settings, setTab }) {
+  const [q, setQ] = useState("");
+  const usageByDay = useMemo(()=> computeRawUsageByDay(loadLS('nd_ledger', []), models), [models]);
+  const rows = useMemo(() => {
+    return models.map(m => {
+      const details = m.bom.map(b => {
+        const r = rawItems.find(x=>x.id===b.rawItemId);
+        const need = b.qty || 0;
+        const stock = r?.stockQty || 0;
+        const possible = need>0 ? Math.floor(stock / need) : Infinity;
+        const u30 = r ? avgDailyUsage(r.id, usageByDay, 30) : 0;
+        const days = r ? daysToStockout(r, u30) : Infinity;
+        return { r, need, stock, possible, days };
+      });
+      const maxUnits = details.length ? Math.min(...details.map(d => d.possible)) : 0;
+      const limiters = details.filter(d => d.possible === maxUnits).map(d => d.r?.name).filter(Boolean).slice(0, 2);
+      const cost = modelCost(m, rawItems, settings);
+      const daysToDef = details.length ? Math.min(...details.map(d => d.days)) : Infinity;
+      return { model: m, cost, maxUnits: isFinite(maxUnits) ? maxUnits : 0, limiters, daysToDef };
+    })
+    .filter(row => !q || row.model.name.toLowerCase().includes(q.toLowerCase()))
+    .sort((a,b) => b.maxUnits - a.maxUnits);
+  }, [models, rawItems, settings, q, usageByDay]);
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-4">
+        <div className="relative">
+          <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Поиск по модели" className="w-72 rounded-xl border border-slate-300 pl-9 pr-3 py-2"/>
+          <span className="absolute left-2.5 top-2.5 text-slate-400"><Icon name="search"/></span>
+        </div>
+        <div className="text-sm text-slate-600">Расчёт из текущих остатков сырья с учётом BOM</div>
+      </div>
+      <Section title="Доступно к производству сейчас" right={<Button variant="ghost" onClick={()=>setTab('orders')}>Перейти к заказам →</Button>}>
+        <div className="overflow-auto">
+          <table className="min-w-full text-sm">
+            <thead>
+              <tr className="text-left text-slate-500"><th className="py-2">Модель</th><th>Тип</th><th className="text-right">Себестоимость (1 шт)</th><th className="text-right">Доступно шт</th><th className="text-right">Дней до дефицита</th><th>Ограничивают</th></tr>
+            </thead>
+            <tbody>
+              {rows.map(row => (
+                <tr key={row.model.id} className="border-t border-slate-100 hover:bg-slate-50">
+                  <td className="py-2 font-medium">{row.model.name}</td>
+                  <td>{row.model.type}</td>
+                  <td className="text-right">{moneyFmt(row.cost, settings.currency)}</td>
+                  <td className="text-right">{fmt.format(row.maxUnits)}</td>
+                  <td className={`text-right ${row.daysToDef<7?'text-red-600':row.daysToDef<14?'text-amber-600':''}`}>{Number.isFinite(row.daysToDef)? Math.floor(row.daysToDef) : '∞'}</td>
+                  <td className="text-slate-600">{row.limiters.length? row.limiters.join(', '): '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Section>
+    </div>
+  );
+}
+
+// ------- Модели и BOM -------
+function ModelsBOM({ models, setModels, rawItems, settings }) {
+  const [showNew, setShowNew] = useState(false);
+  const [editId, setEditId] = useState(null);
+  const [view, setView] = useState('table'); // 'cards' | 'table'
+  const [q, setQ] = useState("");
+  const [filterType, setFilterType] = useState('Все');
+  const [filterMetal, setFilterMetal] = useState('Все');
+  const [filterPhoto, setFilterPhoto] = useState('Любые');
+  const [sortKey, setSortKey] = useState('name'); // name|price|margin|updated
+  const [selectedVars, setSelectedVars] = useState({}); // key: modelId|variantId
+  const [previewColors, setPreviewColors] = useState({}); // key -> color
+  const [editVar, setEditVar] = useState(null); // { modelId, variantId }
+  const perms = ROLE_PERMS[settings.role] || ROLE_PERMS.admin;
+
+  const addModel = (m) => setModels([m, ...models]);
+  const updateModel = (id, patch) => setModels(models.map(m=>m.id!==id? m : { ...m, ...patch }));
+  const onUploadPhoto = async (id, file) => { if (!file) return; const dataUrl = await compressImage(file); updateModel(id, { photoUrl: dataUrl, updatedAt: new Date().toISOString() }); };
+
+  const filtered = useMemo(()=>{
+    // Построить список вариаций как отдельных строк каталога
+    const rows = [];
+    models.forEach(m => {
+      if (m.archived) return;
+      const matchQ = !q || (m.name||'').toLowerCase().includes(q.toLowerCase());
+      const matchType = filterType==='Все' || m.type===filterType;
+      if (!matchQ || !matchType) return;
+      (m.variants||[]).forEach(v => {
+        const matchMetal = filterMetal==='Все' || v.metal===filterMetal;
+        const hasPhoto = !!(v.photoUrl || m.photoUrl);
+        const matchPhoto = filterPhoto==='Любые' || (filterPhoto==='С фото'? hasPhoto : !hasPhoto);
+        if (!matchMetal || !matchPhoto) return;
+        const price = convert(v.salesPrice||0, v.salesCurrency||'KZT', settings.currency, settings.rates);
+        const cost = modelCost(m, rawItems, settings, v.metal, v.color);
+        const margin = Math.max(0, price - cost);
+        rows.push({ m, v, price, cost, margin, key: m.id+'|'+v.id });
+      });
+    });
+    const cmp = (a,b) => {
+      if (sortKey==='price') return b.price - a.price;
+      if (sortKey==='margin') return b.margin - a.margin;
+      if (sortKey==='updated') return new Date(b.m.updatedAt||0) - new Date(a.m.updatedAt||0);
+      return (a.m.name||'').localeCompare(b.m.name||'');
+    };
+    return rows.sort(cmp);
+  }, [models, q, filterType, filterMetal, filterPhoto, sortKey, settings, rawItems]);
+  const allSelected = filtered.length>0 && filtered.every(r => selectedVars[r.key]);
+  const toggleAll = (v) => { const map={}; filtered.forEach(r=> map[r.key]=v); setSelectedVars(map); };
+  const selectedKeys = Object.keys(selectedVars).filter(k=>selectedVars[k]);
+  const bulkVarMarkup = () => {
+    if (!selectedKeys.length) return;
+    const pct = +prompt('На сколько процентов увеличить цены выбранных вариаций?','0')||0;
+    setModels(models.map(m => {
+      const vars = (m.variants||[]).map(v => {
+        const key = m.id+'|'+v.id;
+        if (!selectedKeys.includes(key)) return v;
+        return { ...v, salesPrice: Math.max(0, +(((v.salesPrice||0)*(1+pct/100)).toFixed(2))) };
+      });
+      return { ...m, variants: vars };
+    }));
+    showToast('Цены вариаций обновлены','success');
+  };
+  const bulkVarCurrency = () => {
+    if (!selectedKeys.length) return;
+    const cur = prompt('Укажите валюту (KZT/USD/EUR/...)', settings.currency)||settings.currency;
+    setModels(models.map(m => ({ ...m, variants: (m.variants||[]).map(v => (selectedKeys.includes(m.id+'|'+v.id)? { ...v, salesCurrency: cur } : v)) }))); showToast('Валюта обновлена','success');
+  };
+  const bulkVarPlating = (enable) => {
+    if (!selectedKeys.length) return;
+    setModels(models.map(m => ({ ...m, variants: (m.variants||[]).map(v => (selectedKeys.includes(m.id+'|'+v.id) && v.metal==='Серебро'? { ...v, platingEnabled: enable } : v)) }))); showToast(`Покрытие ${enable?'включено':'выключено'}`,'success');
+  };
+
+  const openVariantEditor = (modelId, variantId) => setEditVar({ modelId, variantId });
+  const saveVariant = (modelId, variantId, patch) => {
+    setModels(models.map(m => m.id!==modelId? m : ({ ...m, variants: (m.variants||[]).map(v=> v.id!==variantId? v : ({ ...v, ...patch })), updatedAt: new Date().toISOString() })));
+    setEditVar(null);
+  };
+
+  const Card = ({ m }) => {
+    const cost = modelCost(m, rawItems, settings);
+    const defVar = getVariant(m, m.defaultMetal||'Золото', m.defaultColor||'Белый');
+    const price = convert((defVar?.salesPrice ?? (m.salesPrice||0)), (defVar?.salesCurrency ?? (m.salesCurrency||'KZT')), settings.currency, settings.rates);
+    const margin = Math.max(0, price - cost);
+    return (
+      <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
+        <div className="flex gap-4 p-4">
+          <div className="w-28 h-28 bg-slate-100 rounded-xl overflow-hidden relative flex items-center justify-center">
+            { (getVariant(m, m.defaultMetal||'Золото', m.defaultColor||'Белый')?.photoUrl || m.photoUrl) ? (
+              <img src={getVariant(m, m.defaultMetal||'Золото', m.defaultColor||'Белый')?.photoUrl || m.photoUrl} alt={m.name} className="w-full h-full object-cover"/>
+            ) : (
+              perms.modelEdit && (
+                <label className="absolute inset-0 grid place-items-center text-slate-500 text-xs cursor-pointer">
+                  Загрузить фото
+                  <input type="file" accept="image/*" className="hidden" onChange={e=>onUploadPhoto(m.id, e.target.files?.[0])}/>
+                </label>
+              )
+            )}
+          </div>
+          <div className="flex-1">
+            <div className="flex items-start justify-between">
+              <div>
+                <div className="font-bold text-lg">{m.name}</div>
+                <div className="text-slate-500 text-sm">{m.type} · {m.defaultMetal||'—'}/{m.defaultColor||'—'}</div>
+              </div>
+              <div className="text-right">
+                <div className="text-xs text-slate-500">Себестоимость</div>
+                <div className="font-semibold">{moneyFmt(cost, settings.currency)}</div>
+              </div>
+            </div>
+            <div className="grid grid-cols-3 gap-3 mt-3">
+              <div><div className="text-xs text-slate-500">Цена</div><div className="font-semibold">{moneyFmt(price, settings.currency)}</div></div>
+              <div><div className="text-xs text-slate-500">Маржа</div><div className="font-semibold">{moneyFmt(margin, settings.currency)}</div></div>
+              <div className="text-right">
+                <Button variant="outline" onClick={()=>setEditId(m.id)}>Изменить</Button>
+              </div>
+            </div>
+            {(m.variants && m.variants.length>0) && (
+              <div className="mt-2 text-xs text-slate-600">
+                Вариации: {m.variants.map(v=> (
+                  <span key={v.id} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 mr-2 mb-1">
+                    {v.metal}
+                    <span className="text-slate-400">·</span>
+                    {moneyFmt(convert(v.salesPrice||0, v.salesCurrency||'KZT', settings.currency, settings.rates), settings.currency)}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-3">
+        {perms.modelEdit && <Button onClick={()=>setShowNew(true)}><Icon name="plus"/> Новая модель</Button>}
+        <div className="relative">
+          <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Поиск по названию" className="w-64 rounded-xl border border-slate-300 pl-9 pr-3 py-2"/>
+          <span className="absolute left-2.5 top-2.5 text-slate-400"><Icon name="search"/></span>
+        </div>
+        <select value={filterType} onChange={e=>setFilterType(e.target.value)} className="rounded-xl border border-slate-300 px-2 py-1.5 text-sm">
+          {['Все','Кольцо','Серьги','Подвеска','Браслет','Колье','Комплект','Пусеты'].map(t=> <option key={t} value={t}>{t}</option>)}
+        </select>
+        <select value={filterMetal} onChange={e=>setFilterMetal(e.target.value)} className="rounded-xl border border-slate-300 px-2 py-1.5 text-sm">
+          {['Все','Золото','Серебро'].map(t=> <option key={t} value={t}>{t}</option>)}
+        </select>
+        <select value={filterPhoto} onChange={e=>setFilterPhoto(e.target.value)} className="rounded-xl border border-slate-300 px-2 py-1.5 text-sm">
+          {['Любые','С фото','Без фото'].map(t=> <option key={t} value={t}>{t}</option>)}
+        </select>
+        <select value={sortKey} onChange={e=>setSortKey(e.target.value)} className="rounded-xl border border-slate-300 px-2 py-1.5 text-sm">
+          <option value="name">По названию</option>
+          <option value="price">По цене</option>
+          <option value="margin">По марже</option>
+          <option value="updated">По изменению</option>
+        </select>
+        <div className="ml-auto flex items-center gap-2">
+          <span className="text-sm text-slate-600">Вид:</span>
+          <button onClick={()=>setView('cards')} className={`px-3 py-1.5 rounded-xl text-sm font-semibold ${view==='cards'?'bg-slate-900 text-white':'bg-white border border-slate-300 text-slate-700'}`}>Карточки</button>
+          <button onClick={()=>setView('table')} className={`px-3 py-1.5 rounded-xl text-sm font-semibold ${view==='table'?'bg-slate-900 text-white':'bg-white border border-slate-300 text-slate-700'}`}>Таблица</button>
+          {perms.modelEdit && <Button variant="danger" onClick={()=>{ if(confirm('Удалить все модели?')) { setModels([]); showToast('Каталог очищен','warn'); } }}>Удалить все</Button>}
+        </div>
+      </div>
+      {selectedKeys.length>0 && (
+        <div className="flex items-center gap-2 mb-3">
+          <Badge color="blue">Выбрано: {selectedKeys.length}</Badge>
+          <Button variant="outline" onClick={bulkVarMarkup}>Наценка (%)</Button>
+          <Button variant="outline" onClick={bulkVarCurrency}>Валюта</Button>
+          <Button variant="outline" onClick={()=>bulkVarPlating(true)}>Вкл. покрытие</Button>
+          <Button variant="outline" onClick={()=>bulkVarPlating(false)}>Выкл. покрытие</Button>
+        </div>
+      )}
+      {view==='cards' ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {filtered.map(({m,v,price,cost,margin}) => {
+            const key = m.id+'|'+v.id;
+            const color = previewColors[key] || 'Белый';
+            const photo = getVariantPhoto(m, v, color);
+            const costCol = modelCost(m, rawItems, settings, v.metal, color);
+            const marginCol = Math.max(0, price - costCol);
+            return (
+            <div key={m.id+'|'+v.id} className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
+              <div className="w-full aspect-[3/2] bg-slate-100 overflow-hidden">
+                {photo? (
+                  <img src={photo} className="w-full h-full object-cover"/>
+                ) : (
+                  <div className="w-full h-full grid place-items-center text-slate-400 text-xs">Нет фото</div>
+                )}
+              </div>
+              <div className="p-4">
+                <div className="font-bold text-base leading-tight">{m.name}</div>
+                <div className="text-slate-500 text-sm mb-2">{m.type} · {v.metal}/{color}</div>
+                <div className="grid grid-cols-3 gap-3">
+                  <div>
+                    <div className="text-xs text-slate-500">Цена</div>
+                    <div className="font-semibold">{moneyFmt(price, settings.currency)}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-slate-500">С/С</div>
+                    <div className="font-semibold">{moneyFmt(costCol, settings.currency)}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-slate-500">Маржа</div>
+                    <div className="font-semibold">{moneyFmt(marginCol, settings.currency)}</div>
+                  </div>
+                </div>
+                <div className="mt-3 flex items-center justify-between">
+                  <div className="flex items-center gap-1">
+                    <span className="text-xs text-slate-500">Цвет:</span>
+                    {['Белый','Жёлтый','Красный'].map(c => (
+                      <button key={c} onClick={()=>setPreviewColors(pc=>({ ...pc, [key]: c }))} className={`px-2 py-1 rounded-lg text-xs font-semibold ${ (previewColors[key]||'Белый')===c? 'bg-slate-900 text-white':'bg-white border border-slate-300 text-slate-700'}`}>{c}</button>
+                    ))}
+                  </div>
+                  <Button variant="outline" onClick={()=>openVariantEditor(m.id, v.id)}>Изменить</Button>
+                </div>
+              </div>
+            </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="overflow-auto bg-white rounded-2xl border border-slate-200">
+          <table className="min-w-full text-sm">
+            <thead><tr className="text-left text-slate-500"><th className="py-2 px-3"><input type="checkbox" checked={allSelected} onChange={e=>toggleAll(e.target.checked)} /></th><th className="py-2 px-3">Фото</th><th>Модель</th><th>Металл</th><th>Тип</th><th className="text-right">Цена</th><th className="text-right">Себестоимость</th><th className="text-right">Маржа</th><th className="text-right">Действия</th></tr></thead>
+            <tbody>
+              {filtered.map(({m,v,price,cost,margin,key}) => (
+                <tr key={key} className="border-t border-slate-100">
+                  <td className="py-2 px-3"><input type="checkbox" checked={!!selectedVars[key]} onChange={e=>setSelectedVars(s=>({ ...s, [key]: e.target.checked }))} /></td>
+                  <td className="py-2 px-3">{(() => { const photo=getVariantPhoto(m, v, m.defaultColor||'Белый'); return photo? <img src={photo} className="w-10 h-10 object-cover rounded"/> : <span className="text-slate-400">—</span>; })()}</td>
+                  <td>{m.name}</td>
+                  <td>{v.metal}</td>
+                  <td>{m.type}</td>
+                  <td className="text-right">{moneyFmt(price, settings.currency)}</td>
+                  <td className="text-right">{moneyFmt(cost, settings.currency)}</td>
+                  <td className="text-right">{moneyFmt(margin, settings.currency)}</td>
+                  <td className="text-right"><div className="flex gap-1 justify-end"><Button variant="outline" onClick={()=>openVariantEditor(m.id, v.id)}>Изменить вариацию</Button><Button variant="ghost" onClick={()=>setEditId(m.id)}>Модель</Button></div></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {showNew && <NewModelModal rawItems={rawItems} settings={settings} onClose={()=>setShowNew(false)} onCreate={(m)=>{ setModels([m, ...models]); setShowNew(false); }} />}
+      {editId && <EditModelModal model={models.find(x=>x.id===editId)} rawItems={rawItems} settings={settings} onClose={()=>setEditId(null)} onSave={(patch)=>{ updateModel(editId, patch); setEditId(null); }} onUploadPhoto={file=>onUploadPhoto(editId, file)} onDelete={()=>{ setModels(models.filter(m=>m.id!==editId)); setEditId(null); }} />}
+      {editVar && (
+        <EditVariantModal
+          model={models.find(x=>x.id===editVar.modelId)}
+          variant={(models.find(x=>x.id===editVar.modelId)?.variants||[]).find(v=>v.id===editVar.variantId)}
+          rawItems={rawItems}
+          settings={settings}
+          onClose={()=>setEditVar(null)}
+          onSave={(patch)=>saveVariant(editVar.modelId, editVar.variantId, patch)}
+          onOpenModel={()=>{ setEditId(editVar.modelId); setEditVar(null); }}
+        />
+      )}
+    </div>
+  );
+}
+
+function EditVariantModal({ model, variant, rawItems, settings, onClose, onSave, onOpenModel }) {
+  if (!model || !variant) return null;
+  const [v, setV] = useState({ ...variant });
+  const upd = (patch) => setV({ ...v, ...patch });
+  const br = modelCostBreakdown(model, rawItems, settings, v.metal, v.color);
+  const price = convert(v.salesPrice||0, v.salesCurrency||'KZT', settings.currency, settings.rates);
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 overflow-auto p-4">
+      <div className="w-full max-w-3xl bg-white rounded-2xl p-4 md:p-6 border border-slate-200 mx-auto my-8 max-h-[85vh] overflow-auto">
+        <div className="flex items-center justify-between mb-3"><div className="text-lg font-bold">{model.name} · {v.metal}/{v.color||model.defaultColor||'Белый'}</div><button className="p-2" onClick={onClose}><Icon name="x" className="w-5 h-5"/></button></div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="space-y-3">
+            <Select label="Цвет" value={v.color|| (model.defaultColor||'Белый')} onChange={val=>upd({ color: val })} options={["Белый","Жёлтый","Красный"]} />
+            <Select label="Валюта продажи" value={v.salesCurrency|| (model.salesCurrency||'KZT')} onChange={val=>upd({ salesCurrency: val })} options={Object.keys(settings.rates)} />
+            <Input label="Цена продажи" type="number" value={v.salesPrice||0} onChange={e=>upd({ salesPrice:+e.target.value })} />
+            <Select label="Валюта доп. себестоимости (металл)" value={v.extraCurrency|| (model.salesCurrency||'KZT')} onChange={val=>upd({ extraCurrency: val })} options={Object.keys(settings.rates)} />
+            <Input label="Доп. себестоимость (металл)" type="number" value={v.extraCost||0} onChange={e=>upd({ extraCost:+e.target.value })} />
+            <Select label="Валюта работы (вариация)" value={v.laborCurrency|| (model.laborCurrency||model.salesCurrency||'KZT')} onChange={val=>upd({ laborCurrency: val })} options={Object.keys(settings.rates)} />
+            <Input label="Работа цеха (за шт, вариация)" type="number" value={v.laborCost??(model.laborCost||0)} onChange={e=>upd({ laborCost:+e.target.value })} />
+            {v.metal==='Серебро' && (
+              <div className="border rounded-xl p-3">
+                <label className="inline-flex items-center gap-2">
+                  <input type="checkbox" checked={!!v.platingEnabled} onChange={e=>upd({ platingEnabled:e.target.checked })}/>
+                  <span>Покрытие</span>
+                </label>
+                {v.platingEnabled && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mt-2">
+                    <Select label="Валюта покрытия" value={v.platingCurrency|| (model.salesCurrency||'KZT')} onChange={val=>upd({ platingCurrency: val })} options={Object.keys(settings.rates)} />
+                    <Input label="Стоимость покрытия" type="number" value={v.platingCost||0} onChange={e=>upd({ platingCost:+e.target.value })} />
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+          <div className="space-y-3">
+            <div className="w-full aspect-[1/1] bg-slate-100 rounded-xl overflow-hidden relative flex items-center justify-center">
+              {v.photoUrl? <img src={v.photoUrl} className="w-full h-full object-cover"/> : <span className="text-slate-400 text-xs">Нет фото</span>}
+              <label className="absolute bottom-2 right-2 inline-flex items-center gap-2 px-3 py-1.5 rounded-xl border border-slate-300 bg-white/80 cursor-pointer text-xs">
+                Загрузить фото
+                <input type="file" accept="image/*" className="hidden" onChange={async e=>{ const f=e.target.files?.[0]; if(!f) return; const d=await compressImage(f); upd({ photoUrl: d }); }}/>
+              </label>
+            </div>
+            <div>
+              <div className="text-xs text-slate-600 mb-1">Фото по цветам</div>
+              <div className="grid grid-cols-3 gap-2">
+                {['Белый','Жёлтый','Красный'].map(c => (
+                  <div key={c} className="bg-slate-100 rounded-xl overflow-hidden relative h-20 flex items-center justify-center">
+                    {v.photosByColor?.[c]? <img src={v.photosByColor[c]} className="w-full h-full object-cover"/> : <span className="text-slate-400 text-xs">{c}</span>}
+                    <label className="absolute bottom-1 right-1 inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-slate-300 bg-white/80 cursor-pointer text-[10px]">
+                      Фото ({c})
+                      <input type="file" accept="image/*" className="hidden" onChange={async e=>{ const f=e.target.files?.[0]; if(!f) return; const d=await compressImage(f); const ph={ ...(v.photosByColor||{}), [c]: d }; upd({ photosByColor: ph }); }}/>
+                    </label>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="bg-slate-50 rounded-xl border border-slate-200 p-3">
+              <div className="font-semibold mb-2">Себестоимость</div>
+              <div className="text-sm grid grid-cols-2 gap-1">
+                <div className="text-slate-600">BOM</div><div className="text-right font-medium">{moneyFmt(br.base, settings.currency)}</div>
+                <div className="text-slate-600">Труд</div><div className="text-right font-medium">{moneyFmt(br.labor, settings.currency)}</div>
+                <div className="text-slate-600">Металл</div><div className="text-right font-medium">{moneyFmt(br.metalAdd, settings.currency)}</div>
+                {v.metal==='Серебро' && v.platingEnabled && <><div className="text-slate-600">Покрытие</div><div className="text-right font-medium">{moneyFmt(br.plating, settings.currency)}</div></>}
+                <div className="col-span-2 border-t my-1"/>
+                <div className="text-slate-700">Итого С/С</div><div className="text-right font-semibold">{moneyFmt(br.total, settings.currency)}</div>
+                <div className="text-slate-700">Цена</div><div className="text-right font-semibold">{moneyFmt(price, settings.currency)}</div>
+                <div className="text-slate-700">Маржа</div><div className="text-right font-semibold">{moneyFmt(Math.max(0, price - br.total), settings.currency)}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div className="flex items-center justify-between mt-3">
+          <Button variant="ghost" onClick={onOpenModel}>Открыть модель (BOM)</Button>
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" onClick={onClose}>Отмена</Button>
+            <Button onClick={()=> onSave(v)}><Icon name="check"/> Сохранить</Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ------- Поставщики -------
+function Suppliers({ suppliers, setSuppliers, settings }) {
+  const perms = ROLE_PERMS[settings.role] || ROLE_PERMS.admin;
+  const [showNew, setShowNew] = useState(false);
+  const add = (s) => setSuppliers([s, ...suppliers]);
+  const update = (id, patch) => setSuppliers(sups => sups.map(s=> s.id!==id? s : { ...s, ...patch }));
+  const remove = (id) => setSuppliers(sups => sups.filter(s=>s.id!==id));
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-4">
+        {perms.rawEdit && <Button onClick={()=>setShowNew(true)}><Icon name="plus"/> Новый поставщик</Button>}
+      </div>
+      <div className="overflow-auto">
+        <table className="min-w-full text-sm">
+          <thead>
+            <tr className="text-left text-slate-500"><th className="py-2">Название</th><th>Валюта</th><th className="text-right">Min заказ</th><th className="text-right">LT (дн)</th><th className="text-right">Рейтинг</th><th className="text-right">Действия</th></tr>
+          </thead>
+          <tbody>
+            {suppliers.map(s => (
+              <tr key={s.id} className="border-t border-slate-100">
+                <td className="py-2"><input disabled={!perms.rawEdit} className="w-full rounded-xl border border-slate-300 px-3 py-2" value={s.name} onChange={e=>update(s.id,{ name:e.target.value })}/></td>
+                <td><select disabled={!perms.rawEdit} className="rounded-xl border border-slate-300 px-3 py-2" value={s.currency} onChange={e=>update(s.id,{ currency:e.target.value })}>{Object.keys(settings.rates).map(c=><option key={c} value={c}>{c}</option>)}</select></td>
+                <td className="text-right"><input disabled={!perms.rawEdit} type="number" className="w-28 rounded-xl border border-slate-300 px-3 py-2 text-right" value={s.minOrder||0} onChange={e=>update(s.id,{ minOrder:+e.target.value })}/></td>
+                <td className="text-right"><input disabled={!perms.rawEdit} type="number" className="w-20 rounded-xl border border-slate-300 px-3 py-2 text-right" value={s.leadTimeDays||7} onChange={e=>update(s.id,{ leadTimeDays:+e.target.value })}/></td>
+                <td className="text-right"><input disabled={!perms.rawEdit} type="number" min={1} max={5} className="w-16 rounded-xl border border-slate-300 px-3 py-2 text-right" value={s.rating||0} onChange={e=>update(s.id,{ rating:+e.target.value })}/></td>
+                <td className="text-right">{perms.rawEdit && <Button variant="danger" onClick={()=>{ if(confirm('Удалить поставщика?')) remove(s.id); }}><Icon name="trash"/></Button>}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {showNew && (
+        <NewSupplierModal settings={settings} onClose={()=>setShowNew(false)} onCreate={(sup)=>{ add(sup); setShowNew(false); }} />
+      )}
+    </div>
+  );
+}
+
+function NewSupplierModal({ settings, onClose, onCreate }) {
+  const [name, setName] = useState('');
+  const [currency, setCurrency] = useState(settings.currency);
+  const [minOrder, setMinOrder] = useState(0);
+  const [leadTimeDays, setLeadTimeDays] = useState(7);
+  const [rating, setRating] = useState(5);
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 overflow-auto p-4">
+      <div className="w-full max-w-xl bg-white rounded-2xl p-4 md:p-6 border border-slate-200 mx-auto my-8 max-h-[85vh] overflow-auto">
+        <div className="flex items-center justify-between mb-3"><div className="text-lg font-bold">Новый поставщик</div><button className="p-2" onClick={onClose}><Icon name="x" className="w-5 h-5"/></button></div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <Input label="Название" value={name} onChange={e=>setName(e.target.value)} />
+          <Select label="Валюта" value={currency} onChange={setCurrency} options={Object.keys(settings.rates)} />
+          <Input label="Min заказ" type="number" value={minOrder} onChange={e=>setMinOrder(+e.target.value)} />
+          <Input label="Lead time (дней)" type="number" value={leadTimeDays} onChange={e=>setLeadTimeDays(+e.target.value)} />
+          <Input label="Рейтинг (1-5)" type="number" value={rating} onChange={e=>setRating(+e.target.value)} />
+        </div>
+        <div className="flex items-center justify-end gap-2 mt-3">
+          <Button variant="ghost" onClick={onClose}>Отмена</Button>
+          <Button onClick={()=> onCreate({ id: uid(), name, currency, minOrder, priceBreaks: [], leadTimeDays, rating })}><Icon name="check"/> Создать</Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ------- Услуги -------
+function Services({ services, setServices, settings }) {
+  const perms = ROLE_PERMS[settings.role] || ROLE_PERMS.admin;
+  const add = (s) => setServices([s, ...services]);
+  const update = (id, patch) => setServices(items => items.map(s=> s.id!==id? s : { ...s, ...patch }));
+  const remove = (id) => setServices(items => items.filter(s=>s.id!==id));
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-4">
+        {perms.modelEdit && <Button onClick={()=>{ const name=prompt('Название услуги','Новая услуга'); if(!name) return; const price=+prompt('Цена','0')||0; const currency=settings.currency; add({ id:uid(), name, price, currency }); }}><Icon name="plus"/> Новая услуга</Button>}
+      </div>
+      <div className="overflow-auto bg-white rounded-2xl border border-slate-200">
+        <table className="min-w-full text-sm">
+          <thead><tr className="text-left text-slate-500"><th className="py-2 px-3">Название</th><th className="text-right">Цена</th><th className="text-right">Валюта</th><th className="text-right">Действия</th></tr></thead>
+          <tbody>
+            {services.map(s=> (
+              <tr key={s.id} className="border-t border-slate-100">
+                <td className="py-2 px-3"><input className="w-full rounded-xl border border-slate-300 px-3 py-2" value={s.name} onChange={e=>update(s.id,{ name:e.target.value })} disabled={!perms.modelEdit}/></td>
+                <td className="text-right"><input type="number" className="w-28 rounded-xl border border-slate-300 px-3 py-2 text-right" value={s.price} onChange={e=>update(s.id,{ price:+e.target.value })} disabled={!perms.modelEdit}/></td>
+                <td className="text-right"><select className="rounded-xl border border-slate-300 px-3 py-2" value={s.currency} onChange={e=>update(s.id,{ currency:e.target.value })} disabled={!perms.modelEdit}>{Object.keys(settings.rates).map(c=><option key={c} value={c}>{c}</option>)}</select></td>
+                <td className="text-right">{perms.modelEdit && <Button variant="danger" onClick={()=>{ if(confirm('Удалить услугу?')) remove(s.id); }}><Icon name="trash"/></Button>}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ------- Заказы поставщикам (PO) -------
+function POs({ suppliers, rawItems, setRawItems, models, jewelryStock, setJewelryStock, settings, ledger, setLedger, pos, setPOs }) {
+  const perms = ROLE_PERMS[settings.role] || ROLE_PERMS.admin;
+  const [filter, setFilter] = useState('Все');
+  const [showNew, setShowNew] = useState(false);
+  const list = pos.filter(p => filter==='Все' || p.status===filter);
+  const supplierName = (id)=> suppliers.find(s=>s.id===id)?.name || '—';
+  const totalPO = (po) => (po.lines||[]).reduce((s,l)=> s + convert((l.price||0)*(l.qty||0), l.currency||'KZT', settings.currency, settings.rates), 0);
+
+  const setStatus = (id, status) => setPOs(items => items.map(p=> p.id!==id? p : ({ ...p, status })));
+  const orderPO = (po) => {
+    setStatus(po.id, 'Отправлен');
+    setLedger(l => [{ id: uid(), type: 'PO_ORDERED', date: new Date().toISOString(), refId: po.id, payload:{ supplier: supplierName(po.supplierId), total: totalPO(po), currency: settings.currency } }, ...l]);
+  };
+  const receivePO = (po) => {
+    try {
+      (po.lines||[]).forEach(l => {
+        if (l.kind==='RAW') {
+          setRawItems(items => items.map(r => r.id!==l.rawItemId? r : ({ ...r, stockQty: (r.stockQty||0) + (l.qty||0) })));
+          setLedger(lg => [{ id: uid(), type:'RAW_IN', date: new Date().toISOString(), refId: po.id, payload:{ rawItemId:l.rawItemId, qty:l.qty } }, ...lg]);
+        } else if (l.kind==='FG') {
+          addFG(jewelryStock, setJewelryStock, l.modelId, l.metal, l.color, l.qty||0);
+          setLedger(lg => [{ id: uid(), type:'FG_IN', date: new Date().toISOString(), refId: po.id, payload:{ modelId:l.modelId, qty:l.qty } }, ...lg]);
+        }
+      });
+      setStatus(po.id, 'Получен');
+    } catch (e) { alert(e.message); }
+  };
+  const closePO = (po) => setStatus(po.id, 'Закрыт');
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-4">
+        {perms.purchaseCreate && <Button onClick={()=>setShowNew(true)}><Icon name="plus"/> Новый заказ поставщику</Button>}
+        <Select label="Статус" value={filter} onChange={setFilter} options={["Все","Черновик","Отправлен","Получен","Закрыт"]} />
+      </div>
+      <div className="overflow-auto">
+        <table className="min-w-full text-sm">
+          <thead><tr className="text-left text-slate-500"><th className="py-2">№</th><th>Поставщик</th><th>Тип</th><th>Дата</th><th>План. дата</th><th>Статус</th><th className="text-right">Сумма</th><th className="text-right">Действия</th></tr></thead>
+          <tbody>
+            {list.map(po => (
+              <tr key={po.id} className="border-t border-slate-100">
+                <td className="py-2">{po.id.slice(-6).toUpperCase()}</td>
+                <td>{supplierName(po.supplierId)}</td>
+                <td>{po.type==='FG'? 'Украшения':'Сырьё'}</td>
+                <td>{new Date(po.createdAt).toLocaleDateString('ru-RU')}</td>
+                <td>{po.eta||'—'}</td>
+                <td>{po.status}</td>
+                <td className="text-right">{moneyFmt(totalPO(po), settings.currency)}</td>
+                <td className="text-right">
+                  <div className="flex justify-end gap-1">
+                    {perms.purchaseCreate && po.status==='Черновик' && <Button variant="outline" onClick={()=>orderPO(po)}>Отправить</Button>}
+                    {perms.purchaseProcess && po.status==='Отправлен' && <Button variant="success" onClick={()=>receivePO(po)}>Приход</Button>}
+                    {perms.purchaseProcess && (po.status==='Получен' || po.status==='Отправлен') && <Button variant="outline" onClick={()=>closePO(po)}>Закрыть</Button>}
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {showNew && <NewPOModal suppliers={suppliers} rawItems={rawItems} models={models} settings={settings} onClose={()=>setShowNew(false)} onCreate={(po)=>{ setPOs([ { ...po, id: uid(), createdAt: new Date().toISOString(), status:'Черновик' }, ...pos ]); setShowNew(false); }} />}
+    </div>
+  );
+}
+
+function NewPOModal({ suppliers, rawItems, models, settings, onClose, onCreate }) {
+  const [supplierId, setSupplierId] = useState(suppliers[0]?.id || '');
+  const [type, setType] = useState('RAW');
+  const [eta, setEta] = useState('');
+  const [lines, setLines] = useState([]);
+  const addLine = () => {
+    if (type==='RAW') setLines([...lines, { id: uid(), kind:'RAW', rawItemId: rawItems[0]?.id, qty:1, price: (rawItems[0]?.costPerUnit||0), currency: rawItems[0]?.currency||'KZT' }]);
+    else setLines([...lines, { id: uid(), kind:'FG', modelId: models[0]?.id, metal: models[0]?.defaultMetal||'Золото', color: models[0]?.defaultColor||'Белый', qty:1, price: (models[0]?.salesPrice||0), currency: models[0]?.salesCurrency||'KZT' }]);
+  };
+  const upd = (id, patch) => setLines(ls => ls.map(l=> l.id!==id? l : ({ ...l, ...patch })));
+  const del = (id) => setLines(ls => ls.filter(l=>l.id!==id));
+  const total = lines.reduce((s,l)=> s + convert((l.price||0)*(l.qty||0), l.currency||'KZT', settings.currency, settings.rates), 0);
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 overflow-auto p-4">
+      <div className="w-full max-w-3xl bg-white rounded-2xl p-4 md:p-6 border border-slate-200 mx-auto my-8 max-h-[85vh] overflow-auto">
+        <div className="flex items-center justify-between mb-3"><div className="text-lg font-bold">Новый заказ поставщику</div><button className="p-2" onClick={onClose}><Icon name="x" className="w-5 h-5"/></button></div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3">
+          <label className="block text-sm mb-3">
+            <span className="block text-slate-600 mb-1">Поставщик</span>
+            <select value={supplierId} onChange={e=>setSupplierId(e.target.value)} className="w-full rounded-xl border border-slate-300 px-3 py-2">
+              {suppliers.map(s=> <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+          </label>
+          <Select label="Что заказываем" value={type} onChange={setType} options={[{id:'RAW',label:'Сырьё'},{id:'FG',label:'Украшения'}].map(x=>x.id)} />
+          <label className="block text-sm mb-3">
+            <span className="block text-slate-600 mb-1">План. дата поставки</span>
+            <input type="date" value={eta} onChange={e=>setEta(e.target.value)} className="w-full rounded-xl border border-slate-300 px-3 py-2"/>
+          </label>
+        </div>
+        <Section title="Позиции заказа" right={<Badge>{`Итого: ${moneyFmt(total, settings.currency)}`}</Badge>}>
+          <div className="space-y-3">
+            {lines.map(l => (
+              <div key={l.id} className="grid grid-cols-1 md:grid-cols-12 gap-2 items-end">
+                {l.kind==='RAW' ? (
+                  <>
+                    <label className="md:col-span-5 text-sm">
+                      <span className="block text-slate-600 mb-1">Сырьё</span>
+                      <select value={l.rawItemId} onChange={e=>upd(l.id,{ rawItemId:e.target.value, price:(rawItems.find(r=>r.id===e.target.value)?.costPerUnit||0), currency:(rawItems.find(r=>r.id===e.target.value)?.currency||'KZT') })} className="w-full rounded-xl border border-slate-300 px-3 py-2">
+                        {rawItems.map(r=> <option key={r.id} value={r.id}>{r.name}</option>)}
+                      </select>
+                    </label>
+                    <label className="md:col-span-2 text-sm">
+                      <span className="block text-slate-600 mb-1">Кол-во</span>
+                      <input type="number" min={1} value={l.qty} onChange={e=>upd(l.id,{ qty:+e.target.value })} className="w-full rounded-xl border border-slate-300 px-3 py-2"/>
+                    </label>
+                  </>
+                ) : (
+                  <>
+                    <label className="md:col-span-4 text-sm">
+                      <span className="block text-slate-600 mb-1">Модель</span>
+                      <select value={l.modelId} onChange={e=>upd(l.id,{ modelId:e.target.value })} className="w-full rounded-xl border border-slate-300 px-3 py-2">
+                        {models.map(m=> <option key={m.id} value={m.id}>{m.name} · {m.type}</option>)}
+                      </select>
+                    </label>
+                    <label className="md:col-span-2 text-sm">
+                      <span className="block text-slate-600 mb-1">Металл</span>
+                      <select value={l.metal} onChange={e=>upd(l.id,{ metal:e.target.value })} className="w-full rounded-xl border border-slate-300 px-3 py-2">
+                        {['Золото','Серебро'].map(v=> <option key={v} value={v}>{v}</option>)}
+                      </select>
+                    </label>
+                    <label className="md:col-span-2 text-sm">
+                      <span className="block text-slate-600 mb-1">Цвет</span>
+                      <select value={l.color} onChange={e=>upd(l.id,{ color:e.target.value })} className="w-full rounded-xl border border-slate-300 px-3 py-2">
+                        {['Белый','Жёлтый','Красный'].map(v=> <option key={v} value={v}>{v}</option>)}
+                      </select>
+                    </label>
+                    <label className="md:col-span-2 text-sm">
+                      <span className="block text-slate-600 mb-1">Кол-во</span>
+                      <input type="number" min={1} value={l.qty} onChange={e=>upd(l.id,{ qty:+e.target.value })} className="w-full rounded-xl border border-slate-300 px-3 py-2"/>
+                    </label>
+                  </>
+                )}
+                <label className="md:col-span-2 text-sm">
+                  <span className="block text-slate-600 mb-1">Валюта</span>
+                  <select value={l.currency||'KZT'} onChange={e=>upd(l.id,{ currency:e.target.value })} className="w-full rounded-xl border border-slate-300 px-3 py-2">
+                    {Object.keys(settings.rates).map(c=> <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </label>
+                <label className="md:col-span-2 text-sm">
+                  <span className="block text-slate-600 mb-1">Цена за ед.</span>
+                  <input type="number" value={l.price||0} onChange={e=>upd(l.id,{ price:+e.target.value })} className="w-full rounded-xl border border-slate-300 px-3 py-2"/>
+                </label>
+                <div className="md:col-span-1 flex items-center justify-end">
+                  <Button variant="danger" onClick={()=>del(l.id)}><Icon name="trash"/></Button>
+                </div>
+              </div>
+            ))}
+            <Button variant="outline" onClick={addLine}><Icon name="plus"/> Добавить позицию</Button>
+          </div>
+        </Section>
+        <div className="flex items-center justify-end gap-2 mt-3">
+          <Button variant="ghost" onClick={onClose}>Отмена</Button>
+          <Button onClick={()=> onCreate({ supplierId, type, eta, lines })}><Icon name="check"/> Создать заказ</Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function NewModelModal({ rawItems, settings, onClose, onCreate }) {
+  const [name, setName] = useState("");
+  const [type, setType] = useState("Кольцо");
+  const [defaultColor, setDefaultColor] = useState("Белый");
+  const [salesCurrency, setSalesCurrency] = useState('KZT');
+  const [salesPrice, setSalesPrice] = useState(0);
+  const [laborCurrency, setLaborCurrency] = useState('KZT');
+  const [laborCost, setLaborCost] = useState(0);
+  const [allowedMetals, setAllowedMetals] = useState(['Золото','Серебро']);
+  const [bom, setBom] = useState([{ rawItemId: rawItems[0]?.id, qty: 1 }]);
+  const [photosByColor, setPhotosByColor] = useState({});
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 overflow-auto p-4">
+      <div className="w-full max-w-2xl bg-white rounded-2xl p-4 md:p-6 border border-slate-200 mx-auto my-8 max-h-[85vh] overflow-auto">
+        <div className="flex items-center justify-between mb-3"><div className="text-lg font-bold">Новая модель</div><button className="p-2" onClick={onClose}><Icon name="x" className="w-5 h-5"/></button></div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
+          <Input label="Название" value={name} onChange={e=>setName(e.target.value)} />
+            <Select label="Тип" value={type} onChange={setType} options={["Кольцо","Серьги","Подвеска","Браслет","Колье","Комплект","Пусеты"]} />
+          {/* Металл по умолчанию убран — определяется по первой вариации */}
+          <Select label="Цвет по умолч." value={defaultColor} onChange={setDefaultColor} options={["Белый","Жёлтый","Красный"]} />
+          <Select label="Валюта продажи" value={salesCurrency} onChange={setSalesCurrency} options={Object.keys(defaultSettings.rates||{KZT:1})} />
+          <Input label="Цена продажи (за шт)" type="number" value={salesPrice} onChange={e=>setSalesPrice(+e.target.value)} />
+          <Select label="Валюта работы (по умолч.)" value={laborCurrency} onChange={setLaborCurrency} options={Object.keys(defaultSettings.rates||{KZT:1})} />
+          <Input label="Работа цеха (за шт, по умолч.)" type="number" value={laborCost} onChange={e=>setLaborCost(+e.target.value)} />
+        </div>
+        <div className="mb-3">
+          <div className="text-sm text-slate-600 mb-1">Вариации (металл) по умолчанию</div>
+          <div className="flex items-center gap-4">
+            {['Золото','Серебро'].map(mt => (
+              <label key={mt} className="inline-flex items-center gap-2">
+                <input type="checkbox" checked={allowedMetals.includes(mt)} onChange={e=>{
+                  const arr = allowedMetals.slice();
+                  if (e.target.checked) { if(!arr.includes(mt)) arr.push(mt); }
+                  else { const i=arr.indexOf(mt); if(i>=0) arr.splice(i,1); }
+                  setAllowedMetals(arr);
+                }}/>
+                <span>{mt}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+        <div className="border rounded-xl">
+          <div className="p-3 text-sm font-semibold bg-slate-50 rounded-t-xl">BOM</div>
+          <div className="divide-y">
+            {bom.map((b, idx)=> (
+              <div key={idx} className="p-3 grid grid-cols-12 gap-2 items-center">
+                <div className="col-span-6">
+                  <select value={b.rawItemId} onChange={e=>setBom(bom.map((bb,i)=> i===idx? { ...bb, rawItemId:e.target.value }: bb))} className="w-full rounded-xl border border-slate-300 px-3 py-2">
+                    {rawItems.map(x=> <option key={x.id} value={x.id}>{x.name} · {x.category}</option>)}
+                  </select>
+                </div>
+                <div className="col-span-3">
+                  <input type="number" min={0} step="0.01" value={b.qty} onChange={e=>setBom(bom.map((bb,i)=> i===idx? { ...bb, qty:+e.target.value }: bb))} className="w-full rounded-xl border border-slate-300 px-3 py-2"/>
+                </div>
+                <div className="col-span-3 flex justify-end">
+                  <Button variant="danger" onClick={()=>setBom(bom.filter((_,i)=>i!==idx))}><Icon name="trash"/></Button>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="p-3">
+            <Button variant="outline" onClick={()=>setBom([...bom, { rawItemId: rawItems[0]?.id, qty: 1 }])}><Icon name="plus"/> Добавить сырьё</Button>
+          </div>
+        </div>
+        <div className="mt-3">
+          <div className="text-sm font-semibold mb-2">Фото модели по цветам</div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {['Белый','Жёлтый','Красный'].map(c => (
+              <div key={c} className="bg-white rounded-xl border border-slate-200 p-3">
+                <div className="text-xs text-slate-600 mb-1">{c}</div>
+                <div className="w-full aspect-[1/1] bg-slate-100 rounded-xl overflow-hidden relative flex items-center justify-center">
+                  {photosByColor[c]? <img src={photosByColor[c]} className="w-full h-full object-cover"/> : <span className="text-slate-400 text-xs">Нет фото</span>}
+                  <label className="absolute bottom-2 right-2 inline-flex items-center gap-2 px-3 py-1.5 rounded-xl border border-slate-300 bg-white/80 cursor-pointer text-xs">
+                    Загрузить
+                    <input type="file" accept="image/*" className="hidden" onChange={async e=>{ const f=e.target.files?.[0]; if(!f) return; const d=await compressImage(f); setPhotosByColor(p=>({ ...p, [c]: d })); }} />
+                  </label>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="flex items-center justify-end gap-2 mt-3">
+          <Button variant="ghost" onClick={onClose}>Отмена</Button>
+          <Button onClick={()=>{ 
+            const gm = settings?.goldMarkupByType || defaultSettings.goldMarkupByType || {};
+            const variants = allowedMetals.map(metal => {
+              const addKZT = gm[type] || 0;
+              const addInCur = convert(addKZT, 'KZT', salesCurrency, (settings?.rates||defaultSettings.rates));
+              const price = metal==='Золото' ? (salesPrice + addInCur) : salesPrice;
+              return { id: uid(), metal, color: defaultColor, salesPrice: price, salesCurrency, extraCost: 0, extraCurrency: salesCurrency, laborCost, laborCurrency, platingEnabled: false, platingCost: 0, platingCurrency: salesCurrency, photoUrl: null };
+            });
+            const ts = new Date().toISOString();
+            const defaultMetal = variants[0]?.metal || 'Золото';
+            const photoUrl = photosByColor[defaultColor] || photosByColor['Белый'] || null;
+            onCreate({ id: uid(), name, type, defaultMetal, defaultColor, salesPrice, salesCurrency, laborCurrency, laborCost, allowedMetals: Array.from(new Set(allowedMetals)), bom, variants, photosByColor, photoUrl, createdAt: ts, updatedAt: ts, archived:false });
+          }}><Icon name="check"/> Создать</Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EditModelModal({ model, rawItems, settings, onClose, onSave, onUploadPhoto, onDelete }) {
+  const [local, setLocal] = useState(ensureVariants(JSON.parse(JSON.stringify(model))));
+  const [dirty, setDirty] = useState(false);
+  const [selectedVarIds, setSelectedVarIds] = useState({});
+  const [previewVarId, setPreviewVarId] = useState((local.variants||[])[0]?.id || null);
+  useEffect(()=>{ const h=(e)=>{ if(dirty){ e.preventDefault(); e.returnValue=''; } }; window.addEventListener('beforeunload', h); return ()=>window.removeEventListener('beforeunload', h); }, [dirty]);
+  const upd = (patch) => { setDirty(true); setLocal({ ...local, ...patch }); };
+  const updBom = (idx, patch) => { setDirty(true); setLocal({ ...local, bom: local.bom.map((b,i)=> i===idx? { ...b, ...patch } : b) }); };
+  const addVariant = (metal) => {
+    const exists = (local.variants||[]).some(v=>v.metal===metal);
+    if (exists) return;
+    const v = {
+      id: uid(),
+      metal,
+      color: local.defaultColor||'Белый',
+      salesPrice: local.salesPrice||0,
+      salesCurrency: local.salesCurrency||'KZT',
+      extraCost: 0,
+      extraCurrency: local.salesCurrency||'KZT',
+      platingEnabled: false,
+      platingCost: 0,
+      platingCurrency: local.salesCurrency||'KZT',
+      photoUrl: null,
+    };
+    setDirty(true);
+    upd({ variants: [...(local.variants||[]), v] });
+  };
+  const updVariant = (id, patch) => {
+    setDirty(true);
+    upd({ variants: (local.variants||[]).map(v=> v.id!==id? v : { ...v, ...patch }) });
+  };
+  const delVariant = (id) => {
+    setDirty(true);
+    upd({ variants: (local.variants||[]).filter(v=>v.id!==id) });
+  };
+  const toggleSelectVar = (id, val) => setSelectedVarIds(s=>({ ...s, [id]: val }));
+  const selectedVarList = Object.keys(selectedVarIds).filter(k=>selectedVarIds[k]);
+  const bulkVarMarkup = () => { const pct=+prompt('На сколько процентов изменить цены выбранных вариаций?','0')||0; upd({ variants: (local.variants||[]).map(v=> selectedVarList.includes(v.id)? { ...v, salesPrice: Math.max(0, +(((v.salesPrice||0)*(1+pct/100)).toFixed(2))) } : v) }); };
+  const bulkVarCurrency = () => { const cur=prompt('Валюта для выбранных (KZT/USD/EUR/...):', local.salesCurrency||'KZT')||local.salesCurrency||'KZT'; upd({ variants: (local.variants||[]).map(v=> selectedVarList.includes(v.id)? { ...v, salesCurrency: cur } : v) }); };
+  const bulkVarPlating = (enable) => { upd({ variants: (local.variants||[]).map(v=> v.metal==='Серебро' && selectedVarList.includes(v.id)? { ...v, platingEnabled: enable } : v) }); };
+  const cancelClose = () => { if(dirty && !confirm('Есть несохранённые изменения. Закрыть без сохранения?')) return; onClose(); };
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 overflow-auto p-4">
+      <div className="w-full max-w-5xl bg-white rounded-2xl p-4 md:p-6 border border-slate-200 mx-auto my-8 max-h-[85vh] overflow-auto">
+        <div className="flex items-center justify-between mb-3"><div className="text-lg font-bold">Изменить модель</div><button className="p-2" onClick={cancelClose}><Icon name="x" className="w-5 h-5"/></button></div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-3">
+          <div>
+            <div className="w-40 h-40 bg-slate-100 rounded-xl overflow-hidden relative flex items-center justify-center">
+              {local.photoUrl? <img src={local.photoUrl} className="w-full h-full object-cover"/> : <span className="text-slate-400 text-xs">Нет фото</span>}
+              <label className="absolute bottom-2 right-2 inline-flex items-center gap-2 px-3 py-1.5 rounded-xl border border-slate-300 bg-white/80 cursor-pointer text-xs">
+                Изменить фото
+                <input type="file" accept="image/*" className="hidden" onChange={e=>{ const f=e.target.files?.[0]; if(f) onUploadPhoto(f); }}/>
+              </label>
+            </div>
+          </div>
+          <div className="md:col-span-2 grid grid-cols-1 md:grid-cols-2 gap-3">
+            <Input label="Название" value={local.name} onChange={e=>upd({ name:e.target.value })} />
+            <Select label="Тип" value={local.type} onChange={v=>upd({ type:v })} options={["Кольцо","Серьги","Подвеска","Браслет","Колье","Комплект","Пусеты"]} />
+            <Select label="Металл по умолч." value={local.defaultMetal||'Золото'} onChange={v=>upd({ defaultMetal:v })} options={["Золото","Серебро"]} />
+            <Select label="Цвет по умолч." value={local.defaultColor||'Белый'} onChange={v=>upd({ defaultColor:v })} options={["Белый","Жёлтый","Красный"]} />
+            <Select label="Валюта продажи" value={local.salesCurrency||'KZT'} onChange={v=>upd({ salesCurrency:v })} options={Object.keys(settings.rates)} />
+            <Input label={`Цена продажи (за шт)`} type="number" value={local.salesPrice||0} onChange={e=>upd({ salesPrice:+e.target.value })} />
+            <label className="inline-flex items-center gap-2 text-sm">
+              <input type="checkbox" checked={!!local.archived} onChange={e=>upd({ archived:e.target.checked })} />
+              <span>Скрывать в каталоге</span>
+            </label>
+          </div>
+          <div className="md:col-span-3 grid grid-cols-1 gap-3">
+            <div>
+              <div className="text-sm font-semibold mb-2">Фото модели по цветам</div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                {['Белый','Жёлтый','Красный'].map(c => (
+                  <div key={c} className="bg-white rounded-xl border border-slate-200 p-3">
+                    <div className="text-xs text-slate-600 mb-1">{c}</div>
+                    <div className="w-full aspect-[1/1] bg-slate-100 rounded-xl overflow-hidden relative flex items-center justify-center">
+                      {(local.photosByColor||{})[c]? <img src={local.photosByColor[c]} className="w-full h-full object-cover"/> : <span className="text-slate-400 text-xs">Нет фото</span>}
+                      <label className="absolute bottom-2 right-2 inline-flex items-center gap-2 px-3 py-1.5 rounded-xl border border-slate-300 bg-white/80 cursor-pointer text-xs">
+                        Загрузить
+                        <input type="file" accept="image/*" className="hidden" onChange={async e=>{ const f=e.target.files?.[0]; if(!f) return; const d=await compressImage(f); upd({ photosByColor: { ...(local.photosByColor||{}), [c]: d } }); }}/>
+                      </label>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="flex items-center justify-between">
+              <div className="text-sm font-semibold">Вариации (металл)</div>
+              <div className="flex items-center gap-2">
+                <label className="text-xs text-slate-600">Добавить вариацию</label>
+                <select className="rounded-xl border border-slate-300 px-2 py-1 text-sm" onChange={e=>{ const v=e.target.value; if(v){ addVariant(v); e.target.value=''; }}} defaultValue="">
+                  <option value="" disabled>—</option>
+                  {['Золото','Серебро'].filter(mt => !(local.variants||[]).some(v=>v.metal===mt)).map(mt => (<option key={mt} value={mt}>{mt}</option>))}
+                </select>
+                {selectedVarList.length>0 && (
+                  <>
+                    <Button variant="outline" onClick={bulkVarMarkup}>Наценка (%)</Button>
+                    <Button variant="outline" onClick={bulkVarCurrency}>Валюта</Button>
+                    <Button variant="outline" onClick={()=>bulkVarPlating(true)}>Вкл. покрытие</Button>
+                    <Button variant="outline" onClick={()=>bulkVarPlating(false)}>Выкл. покрытие</Button>
+                  </>
+                )}
+              </div>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {(local.variants||[]).map(v => (
+                <div key={v.id} className={`border rounded-xl p-3 ${previewVarId===v.id?'bg-slate-50':''}`} onClick={()=>setPreviewVarId(v.id)}>
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="font-semibold flex items-center gap-2"><input type="checkbox" checked={!!selectedVarIds[v.id]} onChange={e=>{ e.stopPropagation(); toggleSelectVar(v.id, e.target.checked); }} /> {v.metal}</div>
+                    <div className="flex items-center gap-2">
+                      <Button variant="danger" onClick={(e)=>{ e.stopPropagation(); delVariant(v.id); }}><Icon name="trash"/></Button>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div className="col-span-1">
+                      <div className="w-full h-32 bg-slate-100 rounded-xl overflow-hidden relative flex items-center justify-center">
+                        {v.photoUrl? <img src={v.photoUrl} className="w-full h-full object-cover"/> : <span className="text-slate-400 text-xs">Нет фото</span>}
+                        <label className="absolute bottom-2 right-2 inline-flex items-center gap-2 px-3 py-1.5 rounded-xl border border-slate-300 bg-white/80 cursor-pointer text-xs">
+                          Фото вариации
+                          <input type="file" accept="image/*" className="hidden" onChange={e=>{ const f=e.target.files?.[0]; if(!f) return; const fr=new FileReader(); fr.onload=()=>updVariant(v.id,{ photoUrl: fr.result }); fr.readAsDataURL(f); }}/>
+                        </label>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-1 gap-3">
+                      <Select label="Цвет" value={v.color|| (local.defaultColor||'Белый')} onChange={val=>updVariant(v.id,{ color: val })} options={["Белый","Жёлтый","Красный"]} />
+                      <Select label="Валюта продажи" value={v.salesCurrency|| (local.salesCurrency||'KZT')} onChange={val=>updVariant(v.id,{ salesCurrency: val })} options={Object.keys(settings.rates)} />
+                      <Input label="Цена продажи" type="number" value={v.salesPrice||0} onChange={e=>updVariant(v.id,{ salesPrice:+e.target.value })} />
+                      <Select label="Валюта доп. себестоимости (металл)" value={v.extraCurrency|| (local.salesCurrency||'KZT')} onChange={val=>updVariant(v.id,{ extraCurrency: val })} options={Object.keys(settings.rates)} />
+                      <Input label="Доп. себестоимость (металл)" type="number" value={v.extraCost||0} onChange={e=>updVariant(v.id,{ extraCost:+e.target.value })} />
+                      <Select label="Валюта работы (вариация)" value={v.laborCurrency|| (local.laborCurrency||local.salesCurrency||'KZT')} onChange={val=>updVariant(v.id,{ laborCurrency: val })} options={Object.keys(settings.rates)} />
+                      <Input label="Работа цеха (вариация)" type="number" value={v.laborCost??(local.laborCost||0)} onChange={e=>updVariant(v.id,{ laborCost:+e.target.value })} />
+                      {v.metal==='Серебро' && (
+                        <div className="border-t pt-2">
+                          <label className="inline-flex items-center gap-2">
+                            <input type="checkbox" checked={!!v.platingEnabled} onChange={e=>updVariant(v.id,{ platingEnabled:e.target.checked })}/>
+                            <span>Покрытие</span>
+                          </label>
+                          {v.platingEnabled && (
+                            <div className="grid grid-cols-2 gap-2 mt-2">
+                              <Select label="Валюта покрытия" value={v.platingCurrency|| (local.salesCurrency||'KZT')} onChange={val=>updVariant(v.id,{ platingCurrency: val })} options={Object.keys(settings.rates)} />
+                              <Input label="Стоимость покрытия" type="number" value={v.platingCost||0} onChange={e=>updVariant(v.id,{ platingCost:+e.target.value })} />
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  <div className="text-xs text-slate-600 mt-2">
+                    {(() => { const br=modelCostBreakdown(local, rawItems, settings, v.metal, v.color); const price=convert(v.salesPrice||0, v.salesCurrency||'KZT', settings.currency, settings.rates); return `С/С: ${moneyFmt(br.total, settings.currency)} · Маржа: ${moneyFmt(Math.max(0, price-br.total), settings.currency)}` })()}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <Select label="Валюта работы" value={local.laborCurrency|| (local.salesCurrency||'KZT')} onChange={v=>upd({ laborCurrency:v })} options={Object.keys(settings.rates)} />
+              <Input label="Работа цеха (за шт)" type="number" value={local.laborCost||0} onChange={e=>upd({ laborCost:+e.target.value })} />
+            </div>
+            <div className="bg-slate-50 rounded-xl border border-slate-200 p-3">
+              <div className="font-semibold mb-2">Разбивка себестоимости (выбранная вариация)</div>
+              {(() => { const v=(local.variants||[]).find(x=>x.id===previewVarId) || (local.variants||[])[0]; if(!v) return <div className="text-slate-500 text-sm">Нет вариаций</div>; const br=modelCostBreakdown(local, rawItems, settings, v.metal, v.color); const price=convert(v.salesPrice||0, v.salesCurrency||'KZT', settings.currency, settings.rates); return (
+                <div className="text-sm grid grid-cols-2 gap-1">
+                  <div className="text-slate-600">BOM</div><div className="text-right font-medium">{moneyFmt(br.base, settings.currency)}</div>
+                  <div className="text-slate-600">Труд</div><div className="text-right font-medium">{moneyFmt(br.labor, settings.currency)}</div>
+                  <div className="text-slate-600">Металл</div><div className="text-right font-medium">{moneyFmt(br.metalAdd, settings.currency)}</div>
+                  {v.metal==='Серебро' && v.platingEnabled && <><div className="text-slate-600">Покрытие</div><div className="text-right font-medium">{moneyFmt(br.plating, settings.currency)}</div></>}
+                  <div className="col-span-2 border-t my-1"/>
+                  <div className="text-slate-700">Итого С/С</div><div className="text-right font-semibold">{moneyFmt(br.total, settings.currency)}</div>
+                  <div className="text-slate-700">Цена</div><div className="text-right font-semibold">{moneyFmt(price, settings.currency)}</div>
+                  <div className="text-slate-700">Маржа</div><div className="text-right font-semibold">{moneyFmt(Math.max(0, price - br.total), settings.currency)}</div>
+                </div>
+              ); })()}
+            </div>
+          </div>
+        </div>
+        <div className="border rounded-xl">
+          <div className="p-3 text-sm font-semibold bg-slate-50 rounded-t-xl">BOM (на 1 шт)</div>
+          <div className="divide-y">
+            {local.bom.map((b, idx)=> (
+              <div key={idx} className="p-3 grid grid-cols-12 gap-2 items-center">
+                <div className="col-span-6">
+                  <select value={b.rawItemId} onChange={e=>updBom(idx,{ rawItemId:e.target.value })} className="w-full rounded-xl border border-slate-300 px-3 py-2">
+                    {rawItems.map(x=> <option key={x.id} value={x.id}>{x.name} · {x.category}</option>)}
+                  </select>
+                </div>
+                <div className="col-span-3">
+                  <input type="number" min={0} step="0.01" value={b.qty} onChange={e=>updBom(idx,{ qty:+e.target.value })} className="w-full rounded-xl border border-slate-300 px-3 py-2"/>
+                </div>
+                <div className="col-span-2">
+                  <input type="number" min={0} step="0.01" value={b.wastePct||0} onChange={e=>updBom(idx,{ wastePct:+e.target.value })} className="w-full rounded-xl border border-slate-300 px-3 py-2"/>
+                  <div className="text-xs text-slate-500 mt-1">Waste %</div>
+                </div>
+                <div className="col-span-1 flex justify-end">
+                  <Button variant="danger" onClick={()=>upd({ bom: local.bom.filter((_,i)=>i!==idx) })}><Icon name="trash"/></Button>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="p-3">
+            <Button variant="outline" onClick={()=>upd({ bom:[...local.bom, { rawItemId: rawItems[0]?.id, qty: 1, wastePct:0 }] })}><Icon name="plus"/> Добавить сырьё</Button>
+          </div>
+        </div>
+        <div className="flex items-center justify-between mt-3">
+          <Button variant="danger" onClick={()=>{ if (confirm('Удалить модель и её BOM?')) onDelete(); }}><Icon name="trash"/> Удалить модель</Button>
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" onClick={cancelClose}>Отмена</Button>
+            <Button onClick={()=>{ onSave({ ...local, updatedAt:new Date().toISOString(), createdAt: local.createdAt || new Date().toISOString() }); setDirty(false); }}><Icon name="check"/> Сохранить</Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ------- Финансы -------
+function Finance({ ledger, orders, settings }) {
+  const perms = ROLE_PERMS[settings.role] || ROLE_PERMS.admin;
+  const payments = ledger.filter(l => l.type==='PAYMENT');
+  const total = payments.reduce((s, p)=> s + convert(p.payload?.amount||0, p.payload?.currency||'KZT', settings.currency, settings.rates), 0);
+  if (!perms.financeView) {
+    return (
+      <Section title="Движение денежных средств">
+        <div className="text-slate-600">Доступ ограничен ролью: {settings.role}</div>
+      </Section>
+    );
+  }
+  return (
+    <Section title="Движение денежных средств" right={<Badge>{moneyFmt(total, settings.currency)}</Badge>}>
+      <div className="overflow-auto">
+        <table className="min-w-full text-sm">
+          <thead>
+            <tr className="text-left text-slate-500"><th className="py-2">Дата/время</th><th>Сумма</th><th>Метод</th><th>Комментарий</th></tr>
+          </thead>
+          <tbody>
+            {payments.map(p => (
+              <tr key={p.id} className="border-t border-slate-100">
+                <td className="py-2">{new Date(p.date).toLocaleString('ru-RU')}</td>
+                <td>
+                  {fmt.format(p.payload.amount)} {p.payload.currency||'KZT'}
+                  <span className="text-slate-400"> · {moneyFmt(convert(p.payload.amount, p.payload.currency||'KZT', settings.currency, settings.rates), settings.currency)}</span>
+                </td>
+                <td>{p.payload.method}</td>
+                <td className="text-slate-600">{p.payload.note||''}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Section>
+  );
+}
+
+// ------- Отчёты -------
+function Reports({ models, rawItems, orders, settings, ledger }) {
+  const costByModel = models.map(m => ({ id: m.id, name: m.name, type: m.type, cost: modelCost(m, rawItems, settings) }));
+
+  const turnover = useMemo(()=>{
+    const payments = ledger.filter(l=>l.type==='PAYMENT');
+    const byDay = {};
+    for (const p of payments) {
+      const key = p.date.slice(0,10);
+      const val = convert(p.payload?.amount||0, p.payload?.currency||'KZT', settings.currency, settings.rates);
+      byDay[key] = (byDay[key]||0) + val;
+    }
+    return Object.entries(byDay).sort(([a],[b])=>a<b?1:-1);
+  }, [ledger, settings]);
+
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+      <Section title="Себестоимость по моделям">
+        <table className="w-full text-sm">
+          <thead><tr className="text-left text-slate-500"><th className="py-2">Модель</th><th>Тип</th><th className="text-right">Себестоимость</th></tr></thead>
+          <tbody>
+            {costByModel.map(c=> (
+              <tr key={c.id} className="border-t border-slate-100"><td className="py-2 font-medium">{c.name}</td><td>{c.type}</td><td className="text-right">{moneyFmt(c.cost, settings.currency)}</td></tr>
+            ))}
+          </tbody>
+        </table>
+      </Section>
+      <Section title="Выручка по дням (поступления)">
+        <table className="w-full text-sm">
+          <thead><tr className="text-left text-slate-500"><th className="py-2">Дата</th><th className="text-right">Сумма</th></tr></thead>
+          <tbody>
+            {turnover.map(([d, s]) => (
+              <tr key={d} className="border-t border-slate-100"><td className="py-2">{d.split('-').reverse().join('.')}</td><td className="text-right">{moneyFmt(s, settings.currency)}</td></tr>
+            ))}
+          </tbody>
+        </table>
+      </Section>
+    </div>
+  );
+}
+
+// ------- Аналитика: Себестоимость -------
+function AnalyticsCost({ models, rawItems, settings }) {
+  const rows = models.map(m => ({ id:m.id, name:m.name, type:m.type, cost: modelCost(m, rawItems, settings) }));
+  return (
+    <Section title="Себестоимость по моделям">
+      <table className="w-full text-sm">
+        <thead><tr className="text-left text-slate-500"><th className="py-2">Модель</th><th>Тип</th><th className="text-right">Себестоимость</th></tr></thead>
+        <tbody>
+          {rows.map(r=> <tr key={r.id} className="border-t border-slate-100"><td className="py-2 font-medium">{r.name}</td><td>{r.type}</td><td className="text-right">{moneyFmt(r.cost, settings.currency)}</td></tr>)}
+        </tbody>
+      </table>
+    </Section>
+  );
+}
+
+// ------- Аналитика: Выручка -------
+function AnalyticsRevenue({ ledger, settings }) {
+  const byDay = useMemo(()=>{
+    const map = {};
+    ledger.filter(l=>l.type==='PAYMENT').forEach(p=>{ const d=p.date.slice(0,10); map[d]=(map[d]||0)+convert(p.payload.amount,p.payload.currency||'KZT',settings.currency,settings.rates); });
+    return Object.entries(map).sort(([a],[b])=>a.localeCompare(b));
+  }, [ledger, settings]);
+  return (
+    <Section title="Выручка по дням">
+      <table className="w-full text-sm">
+        <thead><tr className="text-left text-slate-500"><th className="py-2">Дата</th><th className="text-right">Сумма</th></tr></thead>
+        <tbody>
+          {byDay.map(([d, s])=> <tr key={d} className="border-t border-slate-100"><td className="py-2">{d.split('-').reverse().join('.')}</td><td className="text-right">{moneyFmt(s, settings.currency)}</td></tr>)}
+        </tbody>
+      </table>
+    </Section>
+  );
+}
+
+// ------- Аналитика: ABC/XYZ -------
+function AnalyticsABCXYZ({ models, orders, settings }) {
+  const [range, setRange] = useState('3m'); // 1m,3m,6m,12m,custom
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo] = useState("");
+  const daysMap = { '1m':30, '3m':90, '6m':180, '12m':365 };
+  const [fromDate, toDate] = useMemo(()=>{
+    if (range==='custom' && customFrom && customTo) return [new Date(customFrom), new Date(customTo)];
+    const to = new Date(); const from = new Date(); from.setDate(from.getDate() - (daysMap[range]||90));
+    return [from, to];
+  }, [range, customFrom, customTo]);
+  const salesMap = useMemo(()=>{
+    const map = {}; (orders||[]).filter(o=> o.type==='Клиентский' && new Date(o.createdAt)>=fromDate && new Date(o.createdAt)<=toDate).forEach(o=>{
+      (o.lines||[]).forEach(l=>{ map[l.modelId] = (map[l.modelId]||0) + (l.qty||0); });
+    }); return map;
+  }, [orders, fromDate, toDate]);
+  const horizon = Math.max(1, Math.ceil((toDate - fromDate)/(1000*60*60*24)));
+  const dailyByModel = useMemo(()=>{
+    const map = {}; (orders||[]).filter(o=> o.type==='Клиентский' && new Date(o.createdAt)>=fromDate && new Date(o.createdAt)<=toDate).forEach(o=>{
+      const d = new Date(o.createdAt).toISOString().slice(0,10); (o.lines||[]).forEach(l=>{ (map[l.modelId]=map[l.modelId]||{})[d] = ((map[l.modelId]||{})[d]||0) + (l.qty||0); });
+    }); return map;
+  }, [orders, fromDate, toDate]);
+  const rows = models.map(m => {
+    const totalQty = salesMap[m.id]||0;
+    const turnoverValue = convert(totalQty * (m.salesPrice||0), m.salesCurrency||'KZT', settings.currency, settings.rates);
+    const series = dailyByModel[m.id]||{}; const vals = Array.from({length:horizon}, (_,i)=>{ const d=new Date(fromDate); d.setDate(d.getDate()+i); const k=d.toISOString().slice(0,10); return series[k]||0; });
+    const mean = vals.reduce((a,b)=>a+b,0)/horizon || 0; const variance = vals.reduce((s,x)=> s + Math.pow(x-mean,2), 0) / horizon; const cv = mean? Math.sqrt(variance)/mean : 0;
+    return { m, turnoverValue, cv };
+  });
+  const sorted = [...rows].sort((a,b)=>b.turnoverValue - a.turnoverValue); const total = sorted.reduce((s,x)=>s+x.turnoverValue,0)||1; let acc=0;
+  const classified = sorted.map(x=>{ acc+=x.turnoverValue; const p=acc/total; const abc=p<=0.8?'A':p<=0.95?'B':'C'; const xyz = x.cv<=0.1?'X':x.cv<=0.25?'Y':'Z'; return { ...x, abc, xyz }; });
+  return (
+    <Section title="ABC/XYZ по моделям">
+      <div className="flex items-end gap-2 mb-3">
+        <div className="text-sm text-slate-600">Период:</div>
+        {['1m','3m','6m','12m','custom'].map(k=> (
+          <button key={k} onClick={()=>setRange(k)} className={`px-3 py-1.5 rounded-xl text-sm font-semibold ${range===k?'bg-slate-900 text-white':'bg-white border border-slate-300 text-slate-700'}`}>{k==='custom'?'Произвольный':k}</button>
+        ))}
+        {range==='custom' && (
+          <>
+            <input type="date" value={customFrom} onChange={e=>setCustomFrom(e.target.value)} className="rounded-xl border border-slate-300 px-3 py-2"/>
+            <input type="date" value={customTo} onChange={e=>setCustomTo(e.target.value)} className="rounded-xl border border-slate-300 px-3 py-2"/>
+          </>
+        )}
+      </div>
+      <div className="overflow-auto">
+        <table className="min-w-full text-sm">
+          <thead><tr className="text-left text-slate-500"><th className="py-2">Модель</th><th>Тип</th><th className="text-right">Оборот</th><th className="text-right">CV</th><th className="text-right">ABC</th><th className="text-right">XYZ</th></tr></thead>
+          <tbody>
+            {classified.map(x=> (
+              <tr key={x.m.id} className="border-t border-slate-100">
+                <td className="py-2 font-medium">{x.m.name}</td>
+                <td>{x.m.type}</td>
+                <td className="text-right">{moneyFmt(x.turnoverValue, settings.currency)}</td>
+                <td className="text-right">{x.cv.toFixed(2)}</td>
+                <td className="text-right">{x.abc}</td>
+                <td className="text-right">{x.xyz}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Section>
+  );
+}
+
+function AnalyticsMargin({ models, rawItems, settings }) {
+  const rows = models.map(m => {
+    const cost = modelCost(m, rawItems, settings);
+    const price = convert(m.salesPrice||0, m.salesCurrency||'KZT', settings.currency, settings.rates);
+    const margin = Math.max(0, price - cost);
+    const marginPct = price>0? (margin/price) : 0;
+    return { name:m.name, type:m.type, margin, marginPct };
+  }).sort((a,b)=> b.margin - a.margin).slice(0,10);
+  const labels = rows.map(r=>r.name);
+  const data = rows.map(r=>r.margin);
+  return (
+    <div className="grid grid-cols-1 gap-6">
+      <ChartCard type="bar" title="ТОП моделей по марже (вал.)" dataBuilder={()=>({ labels, datasets:[{ label:'Маржа', data, backgroundColor:'#22c55e' }] })}/>
+      <Section title="Маржа по моделям (таблица)">
+        <table className="w-full text-sm">
+          <thead><tr className="text-left text-slate-500"><th className="py-2">Модель</th><th>Тип</th><th className="text-right">Маржа</th><th className="text-right">Маржа %</th></tr></thead>
+          <tbody>
+            {rows.map(r => <tr key={r.name} className="border-t border-slate-100"><td className="py-2 font-medium">{r.name}</td><td>{r.type}</td><td className="text-right">{moneyFmt(r.margin, settings.currency)}</td><td className="text-right">{(r.marginPct*100).toFixed(0)}%</td></tr>)}
+          </tbody>
+        </table>
+      </Section>
+    </div>
+  );
+}
+
+function AnalyticsStockDays({ rawItems, ledger, models, settings }) {
+  const usageByDay = useMemo(()=> computeRawUsageByDay(ledger, models), [ledger, models]);
+  const rows = rawItems.map(r => {
+    const u30 = avgDailyUsage(r.id, usageByDay, 30);
+    const days = daysToStockout(r, u30);
+    return { name:r.name, unit:r.unit, days };
+  }).sort((a,b)=> a.days - b.days).slice(0,15);
+  const labels = rows.map(r=>r.name);
+  const data = rows.map(r=> Number.isFinite(r.days)? Math.round(r.days) : 999);
+  return (
+    <div className="grid grid-cols-1 gap-6">
+      <ChartCard type="bar" title="Дни запаса (минимальные)" dataBuilder={()=>({ labels, datasets:[{ label:'Дни', data, backgroundColor:'#f59e0b' }] })}/>
+    </div>
+  );
+}
+
+function AnalyticsStockDaysModels({ models, jewelryStock, orders }) {
+  const modelStock = React.useMemo(()=>{
+    const map = {}; (jewelryStock||[]).forEach(j=>{ map[j.modelId]=(map[j.modelId]||0)+(j.qty||0); }); return map;
+  }, [jewelryStock]);
+  const days = 90; const since = new Date(); since.setDate(since.getDate()-days);
+  const dailySales = React.useMemo(()=>{
+    const map = {}; (orders||[]).filter(o=>o.type==='Клиентский' && new Date(o.createdAt)>=since).forEach(o=>{ (o.lines||[]).forEach(l=>{ map[l.modelId]=(map[l.modelId]||0)+(l.qty||0); }); }); Object.keys(map).forEach(k=>{ map[k]=map[k]/days; }); return map;
+  }, [orders]);
+  const rows = Object.keys(modelStock).map(mid=>{
+    const onHand=modelStock[mid]||0, demand=dailySales[mid]||0; const dos=demand>0?onHand/demand:Infinity; const name=(models.find(m=>m.id===mid)?.name)||'—'; return { name, dos };
+  }).sort((a,b)=> a.dos - b.dos);
+  const labels = rows.map(r=>r.name); const data = rows.map(r=> Number.isFinite(r.dos)? Math.round(r.dos):999);
+  return (
+    <Section title="Дни запаса по моделям (90 дней)">
+      <ChartCard type="bar" title="" dataBuilder={()=>({ labels, datasets:[{ label:'Дни', data, backgroundColor:'#0ea5e9' }] })} />
+    </Section>
+  );
+}
+
+// ------- Резерв/Настройки -------
+function Backup({ exportJSON, importJSON, resetAll, settings, setSettings }) {
+  const perms = ROLE_PERMS[settings.role] || ROLE_PERMS.admin;
+  const codes = Object.keys(settings.rates);
+  const setRate = (code, val) => setSettings({ ...settings, rates: { ...settings.rates, [code]: +val || 0 } });
+  const addCurrency = () => {
+    const code = (prompt('Код валюты (напр. USD, EUR)', '') || '').toUpperCase().trim();
+    if (!code) return;
+    if (settings.rates[code]) { alert('Такая валюта уже есть'); return; }
+    const rate = +prompt('Курс: сколько KZT за 1 ' + code, '500') || 0;
+    setSettings({ ...settings, rates: { ...settings.rates, [code]: rate } });
+  };
+  const removeCurrency = (code) => {
+    if (code === 'KZT') { alert('Нельзя удалить базовую валюту KZT'); return; }
+    const r = { ...settings.rates }; delete r[code];
+    const nextCurrency = settings.currency === code ? 'KZT' : settings.currency;
+    setSettings({ ...settings, currency: nextCurrency, rates: r });
+  };
+
+  return (
+    <Section title="Резервное копирование и настройки">
+      <div className="flex flex-col gap-4">
+        <div className="flex flex-wrap items-end gap-3">
+          <div>
+            <div className="text-xs text-slate-500 mb-1">Текущая валюта отображения</div>
+            <select value={settings.currency} onChange={e=>setSettings({ ...settings, currency: e.target.value })} className="rounded-xl border border-slate-300 px-3 py-2">
+              {codes.map(c=> <option key={c} value={c}>{c}</option>)}
+            </select>
+          </div>
+          <div>
+            <div className="text-xs text-slate-500 mb-1">Роль пользователя</div>
+            <select value={settings.role} onChange={e=>setSettings({ ...settings, role: e.target.value })} className="rounded-xl border border-slate-300 px-3 py-2">
+              {['admin','manager','master'].map(r=> <option key={r} value={r}>{r}</option>)}
+            </select>
+          </div>
+          <div className="text-xs text-slate-500 ml-2">Версия схемы: v{SCHEMA_VERSION}</div>
+        </div>
+
+        <div className="bg-white rounded-2xl border border-slate-200 p-4">
+          <div className="flex items-center justify-between mb-3">
+            <div className="font-semibold">Курсы валют (KZT за 1 единицу)</div>
+            {perms.ratesEdit && <Button variant="outline" onClick={addCurrency}><Icon name="plus"/> Добавить валюту</Button>}
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {codes.map(code => (
+              <div key={code} className="flex items-center gap-2">
+                <div className="w-20 font-semibold">{code}</div>
+                <input type="number" className="w-40 rounded-xl border border-slate-300 px-3 py-2" value={settings.rates[code]} onChange={e=>perms.ratesEdit && setRate(code, e.target.value)} disabled={!perms.ratesEdit} />
+                {perms.ratesEdit && code!=='KZT' && <Button variant="danger" onClick={()=>removeCurrency(code)}><Icon name="trash"/></Button>}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="bg-white rounded-2xl border border-slate-200 p-4">
+          <div className="font-semibold mb-2">Наценка для золота (KZT, к базовой себестоимости)</div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
+            {[
+              ['Кольцо', 180000],
+              ['Серьги', 300000],
+              ['Подвеска', 200000],
+              ['Пусеты', 225000],
+            ].map(([t, def]) => (
+              <label key={t} className="block text-sm">
+                <span className="block text-slate-600 mb-1">{t}</span>
+                <input type="number" value={(settings.goldMarkupByType||{})[t]??def}
+                  onChange={e=> setSettings({ ...settings, goldMarkupByType: { ...(settings.goldMarkupByType||{}), [t]: +e.target.value } })}
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2" />
+              </label>
+            ))}
+          </div>
+          <div className="text-xs text-slate-500 mt-2">Применяется автоматически только для металла “Золото”. Для серебра используется базовая себестоимость (без наценки).</div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3">
+          <Button onClick={exportJSON}><Icon name="download"/> Экспортировать JSON</Button>
+          <label className="inline-flex items-center gap-2 px-3 py-2 rounded-xl border border-slate-300 cursor-pointer">
+            <Icon name="upload"/> Импортировать JSON
+            <input type="file" accept="application/json" className="hidden" onChange={e=>{ const f=e.target.files?.[0]; if(f) importJSON(f); }} />
+          </label>
+          {perms.reset && <Button variant="danger" onClick={()=>{ if(confirm('Сбросить все данные к демо-набору?')) resetAll(); }}>Сбросить демо-данные</Button>}
+        </div>
+        <div className="text-sm text-slate-500">Данные хранятся в браузере (localStorage). Сделайте экспорт перед очисткой кэша.</div>
+
+        <div className="bg-white rounded-2xl border border-slate-200 p-4">
+          <div className="font-semibold mb-2">Облако (Supabase)</div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <Input label="Supabase URL" value={settings.supabaseUrl||''} onChange={e=>setSettings({ ...settings, supabaseUrl: e.target.value })} />
+            <Input label="Supabase anon key" value={settings.supabaseAnon||''} onChange={e=>setSettings({ ...settings, supabaseAnon: e.target.value })} />
+            <Input label="Bucket (для фото)" value={settings.supabaseBucket||'photos'} onChange={e=>setSettings({ ...settings, supabaseBucket: e.target.value })} />
+            <Input label="Организация (org)" value={settings.org||'default'} onChange={e=>setSettings({ ...settings, org: e.target.value })} />
+          </div>
+          <div className="flex items-center gap-2 mt-2">
+            <Button variant="outline" onClick={async()=>{
+              try {
+                if (!window.supabase) throw new Error('Библиотека Supabase не загружена');
+                const client = window.supabase.createClient(settings.supabaseUrl, settings.supabaseAnon);
+                const { data, error } = await client.from('nd_state').select('org').limit(1);
+                if (error) throw error; showToast('Подключение успешно', 'success');
+              } catch (e) { console.error(e); showToast('Ошибка подключения: ' + (e.message||e), 'danger'); }
+            }}>Проверить</Button>
+            <Button variant="outline" onClick={async()=>{
+              try {
+                if (!window.supabase) throw new Error('Supabase не загружен');
+                const client = window.supabase.createClient(settings.supabaseUrl, settings.supabaseAnon);
+                const blob = {
+                  version: (window.SCHEMA_VERSION||0),
+                  rawItems: loadLS('nd_raw', []),
+                  models: loadLS('nd_models', []),
+                  jewelryStock: loadLS('nd_fg', []),
+                  orders: loadLS('nd_orders', []),
+                  ledger: loadLS('nd_ledger', []),
+                  settings: loadLS('nd_settings', defaultSettings),
+                  suppliers: loadLS('nd_suppliers', []),
+                  pos: loadLS('nd_pos', []),
+                  services: loadLS('nd_services', []),
+                  savedAt: new Date().toISOString(),
+                };
+                const { error } = await client.from('nd_state').upsert({ org: settings.org||'default', blob, updated_at: new Date().toISOString() });
+                if (error) throw error; showToast('Сохранено в облако', 'success');
+              } catch (e) { console.error(e); showToast('Ошибка сохранения: ' + (e.message||e), 'danger'); }
+            }}>Сохранить в облако</Button>
+            <Button variant="outline" onClick={async()=>{
+              try {
+                if (!window.supabase) throw new Error('Supabase не загружен');
+                const client = window.supabase.createClient(settings.supabaseUrl, settings.supabaseAnon);
+                const { data, error } = await client.from('nd_state').select('blob, updated_at').eq('org', settings.org||'default').single();
+                if (error) throw error; if (!data?.blob) throw new Error('Нет данных в облаке');
+                const file = new File([JSON.stringify(data.blob)], 'cloud-state.json', { type: 'application/json' });
+                await importJSON(file);
+                showToast('Загружено из облака ('+ new Date(data.updated_at).toLocaleString('ru-RU') +')', 'success');
+              } catch (e) { console.error(e); showToast('Ошибка загрузки: ' + (e.message||e), 'danger'); }
+            }}>Загрузить из облака</Button>
+          </div>
+          <div className="text-xs text-slate-500 mt-2">Подробности и SQL для таблиц см. в README.md (раздел Supabase).</div>
+        </div>
+      </div>
+    </Section>
+  );
+}
+
+    ReactDOM.createRoot(document.getElementById('app')).render(<NeoDiamondWMS />);
+  </script>
+</body>
+</html>
