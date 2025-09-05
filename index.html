@@ -47,6 +47,7 @@ const defaultSettings = {
   supabaseAnon: '',
   supabaseBucket: 'photos',
   org: 'default',
+  supabaseAuto: true,
 };
 const ROLE_PERMS = {
   admin: { rawEdit:true, rawAdjust:true, modelEdit:true, fgAdjust:true, ordersCreate:true, payments:true, process:true, financeView:true, ratesEdit:true, reset:true, purchaseCreate:true, purchaseProcess:true },
@@ -109,6 +110,35 @@ async function compressImage(file, maxW=1400, maxH=1400, quality=0.85) {
     console.error('compressImage failed, fallback to original', e);
     return await readFileAsDataURL(file);
   }
+}
+
+// Supabase helpers
+function getSupabaseClient(settings) {
+  try {
+    if (!window.supabase) return null;
+    if (!settings?.supabaseUrl || !settings?.supabaseAnon) return null;
+    return window.supabase.createClient(settings.supabaseUrl, settings.supabaseAnon);
+  } catch { return null; }
+}
+async function dataUrlToFile(dataUrl, name='image.jpg') {
+  const res = await fetch(dataUrl); const blob = await res.blob();
+  return new File([blob], name, { type: blob.type||'image/jpeg' });
+}
+async function supabaseUploadImage(fileOrDataUrl, settings, path) {
+  const client = getSupabaseClient(settings);
+  if (!client) return null;
+  let file = null;
+  if (fileOrDataUrl instanceof File) file = fileOrDataUrl;
+  else if (typeof fileOrDataUrl === 'string') file = await dataUrlToFile(fileOrDataUrl, path.split('/').pop()||'image.jpg');
+  else return null;
+  const bucket = settings.supabaseBucket || 'photos';
+  const { error } = await client.storage.from(bucket).upload(path, file, { upsert: true, contentType: file.type||'image/jpeg' });
+  if (error) { console.error('supabase upload error', error); return null; }
+  const { data } = client.storage.from(bucket).getPublicUrl(path);
+  return data?.publicUrl || null;
+}
+function debounce(fn, delay=1000) {
+  let t; return (...args)=>{ clearTimeout(t); t=setTimeout(()=>fn(...args), delay); };
 }
 
 // Версионирование и миграции
@@ -234,6 +264,22 @@ function useStore() {
   useEffect(() => saveLS("nd_orders", orders), [orders]);
   useEffect(() => saveLS("nd_ledger", ledger), [ledger]);
   useEffect(() => saveLS("nd_settings", settings), [settings]);
+
+  // Автосинхронизация в Supabase (если включена)
+  const autoCloudSave = React.useMemo(()=> debounce(async (payload)=>{
+    try {
+      const client = getSupabaseClient(settings);
+      if (!client) return;
+      await client.from('nd_state').upsert({ org: settings.org||'default', blob: payload, updated_at: new Date().toISOString() });
+    } catch (e) { console.warn('Auto cloud save failed', e); }
+  }, 1500), [settings.supabaseUrl, settings.supabaseAnon, settings.org]);
+
+  useEffect(()=>{
+    if (!settings?.supabaseAuto) return;
+    if (!settings?.supabaseUrl || !settings?.supabaseAnon) return;
+    const payload = { version: SCHEMA_VERSION, rawItems, models, jewelryStock, orders, ledger, settings, suppliers, pos, services, savedAt: new Date().toISOString() };
+    autoCloudSave(payload);
+  }, [rawItems, models, jewelryStock, orders, ledger, suppliers, pos, services, settings.supabaseUrl, settings.supabaseAnon, settings.org, settings.supabaseAuto]);
   useEffect(() => saveLS("nd_suppliers", suppliers), [suppliers]);
   useEffect(() => saveLS("nd_pos", pos), [pos]);
   useEffect(() => saveLS("nd_services", services), [services]);
@@ -1849,7 +1895,14 @@ function ModelsBOM({ models, setModels, rawItems, settings }) {
 
   const addModel = (m) => setModels([m, ...models]);
   const updateModel = (id, patch) => setModels(models.map(m=>m.id!==id? m : { ...m, ...patch }));
-  const onUploadPhoto = async (id, file) => { if (!file) return; const dataUrl = await compressImage(file); updateModel(id, { photoUrl: dataUrl, updatedAt: new Date().toISOString() }); };
+  const onUploadPhoto = async (id, file) => {
+    if (!file) return;
+    const dataUrl = await compressImage(file);
+    const path = `models/${id}/main-${Date.now()}.jpg`;
+    const url = await supabaseUploadImage(await dataUrlToFile(dataUrl, 'main.jpg'), settings, path);
+    const photoUrl = url || dataUrl;
+    updateModel(id, { photoUrl, updatedAt: new Date().toISOString() });
+  };
 
   const filtered = useMemo(()=>{
     // Построить список вариаций как отдельных строк каталога
@@ -2131,7 +2184,7 @@ function EditVariantModal({ model, variant, rawItems, settings, onClose, onSave,
               {v.photoUrl? <img src={v.photoUrl} className="w-full h-full object-cover"/> : <span className="text-slate-400 text-xs">Нет фото</span>}
               <label className="absolute bottom-2 right-2 inline-flex items-center gap-2 px-3 py-1.5 rounded-xl border border-slate-300 bg-white/80 cursor-pointer text-xs">
                 Загрузить фото
-                <input type="file" accept="image/*" className="hidden" onChange={async e=>{ const f=e.target.files?.[0]; if(!f) return; const d=await compressImage(f); upd({ photoUrl: d }); }}/>
+                    <input type="file" accept="image/*" className="hidden" onChange={async e=>{ const f=e.target.files?.[0]; if(!f) return; const d=await compressImage(f); const path=`models/${model.id}/variants/${v.id}/main-${Date.now()}.jpg`; const url=await supabaseUploadImage(await dataUrlToFile(d,'main.jpg'), settings, path); upd({ photoUrl: url||d }); }}/>
               </label>
             </div>
             <div>
@@ -2142,7 +2195,7 @@ function EditVariantModal({ model, variant, rawItems, settings, onClose, onSave,
                     {v.photosByColor?.[c]? <img src={v.photosByColor[c]} className="w-full h-full object-cover"/> : <span className="text-slate-400 text-xs">{c}</span>}
                     <label className="absolute bottom-1 right-1 inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-slate-300 bg-white/80 cursor-pointer text-[10px]">
                       Фото ({c})
-                      <input type="file" accept="image/*" className="hidden" onChange={async e=>{ const f=e.target.files?.[0]; if(!f) return; const d=await compressImage(f); const ph={ ...(v.photosByColor||{}), [c]: d }; upd({ photosByColor: ph }); }}/>
+                      <input type="file" accept="image/*" className="hidden" onChange={async e=>{ const f=e.target.files?.[0]; if(!f) return; const d=await compressImage(f); const path=`models/${model.id}/variants/${v.id}/color-${c}-${Date.now()}.jpg`; const url=await supabaseUploadImage(await dataUrlToFile(d,`color-${c}.jpg`), settings, path); const ph={ ...(v.photosByColor||{}), [c]: url||d }; upd({ photosByColor: ph }); }}/>
                     </label>
                   </div>
                 ))}
@@ -2510,7 +2563,7 @@ function NewModelModal({ rawItems, settings, onClose, onCreate }) {
                   {photosByColor[c]? <img src={photosByColor[c]} className="w-full h-full object-cover"/> : <span className="text-slate-400 text-xs">Нет фото</span>}
                   <label className="absolute bottom-2 right-2 inline-flex items-center gap-2 px-3 py-1.5 rounded-xl border border-slate-300 bg-white/80 cursor-pointer text-xs">
                     Загрузить
-                    <input type="file" accept="image/*" className="hidden" onChange={async e=>{ const f=e.target.files?.[0]; if(!f) return; const d=await compressImage(f); setPhotosByColor(p=>({ ...p, [c]: d })); }} />
+                    <input type="file" accept="image/*" className="hidden" onChange={async e=>{ const f=e.target.files?.[0]; if(!f) return; const d=await compressImage(f); const path=`models/${name||'model'}/colors/${c}-${Date.now()}.jpg`; const url=await supabaseUploadImage(await dataUrlToFile(d,`color-${c}.jpg`), settings||defaultSettings, path); setPhotosByColor(p=>({ ...p, [c]: url||d })); }} />
                   </label>
                 </div>
               </div>
@@ -3081,6 +3134,10 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings }) {
             <Input label="Bucket (для фото)" value={settings.supabaseBucket||'photos'} onChange={e=>setSettings({ ...settings, supabaseBucket: e.target.value })} />
             <Input label="Организация (org)" value={settings.org||'default'} onChange={e=>setSettings({ ...settings, org: e.target.value })} />
           </div>
+          <label className="inline-flex items-center gap-2 mt-2 text-sm">
+            <input type="checkbox" checked={!!settings.supabaseAuto} onChange={e=>setSettings({ ...settings, supabaseAuto: e.target.checked })} />
+            <span>Автосинхронизация изменений в облако</span>
+          </label>
           <div className="flex items-center gap-2 mt-2">
             <Button variant="outline" onClick={async()=>{
               try {
