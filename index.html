@@ -3251,21 +3251,7 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
             </div>
           </>
         )}
-        <div className="flex flex-wrap items-end gap-3">
-          <div>
-            <div className="text-xs text-slate-500 mb-1">Текущая валюта отображения</div>
-            <select value={settings.currency} onChange={e=>setSettings({ ...settings, currency: e.target.value })} className="rounded-xl border border-slate-300 px-3 py-2">
-              {codes.map(c=> <option key={c} value={c}>{c}</option>)}
-            </select>
-          </div>
-          <div>
-            <div className="text-xs text-slate-500 mb-1">Роль пользователя</div>
-            <select value={settings.role} onChange={e=>setSettings({ ...settings, role: e.target.value })} className="rounded-xl border border-slate-300 px-3 py-2">
-              {['admin','manager','master'].map(r=> <option key={r} value={r}>{r}</option>)}
-            </select>
-          </div>
-          <div className="text-xs text-slate-500 ml-2">Версия схемы: v{SCHEMA_VERSION}</div>
-        </div>
+        
 
         {tab==='users' && (
           <UsersTab />
@@ -3275,6 +3261,7 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
 
         
 
+        {tab==='tech' && (<>
         <div className="flex flex-wrap items-center gap-3">
           <Button onClick={exportJSON}><Icon name="download"/> Экспортировать JSON</Button>
           <label className="inline-flex items-center gap-2 px-3 py-2 rounded-xl border border-slate-300 cursor-pointer">
@@ -3383,6 +3370,7 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
           </div>
           <div className="text-xs text-slate-500 mt-2">Подробности и SQL для таблиц см. в README.md (раздел Supabase).</div>
         </div>
+        </>)}
       </div>
       </div>
     </Section>
