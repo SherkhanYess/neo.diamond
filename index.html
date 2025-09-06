@@ -114,6 +114,9 @@ const defaultSettings = {
   org: 'default',
   supabaseAuto: true,
   supabaseCloudFirst: false,
+  // Второй API (внешний Supabase) для выгрузки каталога
+  secondSupabaseUrl: '',
+  secondSupabaseAnon: '',
   // Параметры мастера
   allowSelfAssignMaster: true, // Разрешить мастеру брать задачу в работу
   showPickListDiamondsOnly: true, // Пик-лист только бриллиантов
@@ -899,6 +902,47 @@ function issueFG(jewelryStock, setJewelryStock, modelId, metal, color, qty) {
   const next = [...jewelryStock];
   next[idx] = { ...cur, qty: cur.qty - qty };
   setJewelryStock(next);
+}
+
+// ===== Выгрузка каталога во второй Supabase (products) =====
+async function syncProductsToSecondAPI(models, secondUrl, secondAnon) {
+  try {
+    if (!window.supabase) throw new Error('supabase-js не загружен');
+    if (!secondUrl || !secondAnon) throw new Error('Укажите URL и anon key второго Supabase');
+    const client = window.supabase.createClient(secondUrl, secondAnon);
+    const makeSkuForModel = (m) => {
+      const base = String(m.name||'MODEL').replace(/\s+/g,'-').toUpperCase().slice(0,24);
+      return m.sku || `SR-${base}`;
+    };
+    const pickPhotos = (m) => ({
+      gold_img: (m?.photosByColor?.['Жёлтый']) || null,
+      silver_img: (m?.photosByColor?.['Белый']) || null,
+    });
+    const rows = (models||[]).map(m => {
+      const sku = makeSkuForModel(m);
+      const price = +(m.salesPrice||0);
+      const image_url = m.photoUrl || null;
+      const { gold_img, silver_img } = pickPhotos(m);
+      return {
+        sku,
+        name: m.name||'',
+        price,
+        image_url,
+        gold_img,
+        silver_img,
+        description: m.description||'',
+      };
+    });
+    if (!rows.length) return { ok:true, rows:0, note:'Нет моделей для синхронизации' };
+    const { data, error } = await client
+      .from('products')
+      .upsert(rows, { onConflict: 'sku' })
+      .select();
+    if (error) return { ok:false, error };
+    return { ok:true, rows: Array.isArray(data)? data.length : 0 };
+  } catch (e) {
+    return { ok:false, error: { message: String(e?.message||e) } };
+  }
 }
 
 // ------- Главный компонент -------
@@ -4189,6 +4233,31 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
             }}>Миграция фото в облако</Button>
           </div>
           <div className="text-xs text-slate-500 mt-2">Подробности и SQL для таблиц см. в README.md (раздел Supabase).</div>
+        </div>
+
+        <div className="bg-white rounded-2xl border border-slate-200 p-4">
+          <div className="font-semibold mb-2">Второй API (Supabase) — Каталог</div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <Input label="Second Supabase URL" value={settings.secondSupabaseUrl||''} onChange={e=>setSettings({ ...settings, secondSupabaseUrl: e.target.value })} />
+            <label className="block text-sm mb-3">
+              <span className="block text-slate-600 mb-1">Second anon key</span>
+              <div className="flex items-center gap-2">
+                <input type="password" readOnly value={settings.secondSupabaseAnon? '••••••••':'не задан'} className="w-full rounded-xl border border-slate-300 px-3 py-2 bg-slate-50" />
+                <Button variant="outline" onClick={()=>{ const v=prompt('Введите/замените second anon key',''); if(v) setSettings({ ...settings, secondSupabaseAnon: v }); }}>Изменить</Button>
+              </div>
+            </label>
+          </div>
+          <div className="flex items-center gap-2 mt-2">
+            <Button variant="outline" onClick={async()=>{
+              try{
+                if (!settings.secondSupabaseUrl || !settings.secondSupabaseAnon) { showToast('Заполните Second URL и anon key','warn'); return; }
+                const r = await syncProductsToSecondAPI(models, settings.secondSupabaseUrl, settings.secondSupabaseAnon);
+                if (!r.ok) throw new Error(r.error?.message || 'Ошибка синхронизации');
+                showToast(`Синхронизировано продуктов: ${r.rows||0}`,'success');
+              }catch(e){ showToast('Сбой синхронизации: ' + (e.message||e),'error'); }
+            }}>Синхронизировать каталог (products)</Button>
+          </div>
+          <div className="text-xs text-slate-500 mt-2">Выгружает текущие модели в таблицу public.products второго проекта. Требуется UNIQUE индекс по sku.</div>
         </div>
         </>)}
       </div>
