@@ -2,11 +2,12 @@ name: Deploy Cloudflare Worker
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main ]
     paths:
       - 'api/**'
       - 'wrangler.toml'
       - '.github/workflows/worker.yml'
+  workflow_dispatch: {}
 
 jobs:
   deploy:
@@ -15,10 +16,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Publish
+      - name: Publish Worker via Wrangler
         uses: cloudflare/wrangler-action@v3
         with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          secrets: |
+            TELEGRAM_BOT_TOKEN
+            TELEGRAM_CHAT_ID
           command: publish
-
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
