@@ -329,6 +329,14 @@ function useStore() {
   const [services, setServices] = useState(() => loadLS("nd_services", seedServices()));
   const [users, setUsers] = useState(() => loadLS("nd_users", []));
 
+  // Идентификатор клиента для RT-синхронизации (чтобы игнорировать собственные события)
+  const clientIdRef = React.useRef(null);
+  if (!clientIdRef.current) {
+    const ex = loadLS('nd_client_id', null);
+    if (ex) clientIdRef.current = ex; else { const v = uid(); clientIdRef.current = v; saveLS('nd_client_id', v); }
+  }
+  const lastCloudAppliedRef = React.useRef(null);
+
   // Миграции
   useEffect(()=>{
     const v = loadVersion();
@@ -427,6 +435,7 @@ function useStore() {
         setServices(Array.isArray(b.services)? b.services : services);
         setPOs(Array.isArray(b.pos)? b.pos : []);
         setSettings({ ...settings, ...(b.settings||{}) });
+        lastCloudAppliedRef.current = data.updated_at || new Date().toISOString();
         cloudLoadedRef.current = true;
         showToast('Загружено из облака при старте', 'success');
       } catch (e) { console.warn('cloud-first load failed', e); }
@@ -445,7 +454,7 @@ function useStore() {
   useEffect(()=>{
     if (!settings?.supabaseAuto) return;
     if (!settings?.supabaseUrl || !settings?.supabaseAnon) return;
-    const payload = { version: SCHEMA_VERSION, rawItems, models, jewelryStock, orders, ledger, settings, suppliers, pos, services, users: loadLS('nd_users', []), savedAt: new Date().toISOString() };
+    const payload = { version: SCHEMA_VERSION, rawItems, models, jewelryStock, orders, ledger, settings, suppliers, pos, services, users: loadLS('nd_users', []), savedAt: new Date().toISOString(), clientId: clientIdRef.current, org: settings.org||'default' };
     autoCloudSave(payload);
   }, [rawItems, models, jewelryStock, orders, ledger, suppliers, pos, services, settings.supabaseUrl, settings.supabaseAnon, settings.org, settings.supabaseAuto]);
   useEffect(() => saveLS("nd_suppliers", suppliers), [suppliers]);
@@ -487,6 +496,41 @@ function useStore() {
     if (data.users) setUsers(data.users);
     saveVersion(data.version ? +data.version : SCHEMA_VERSION);
   };
+
+  // Realtime подписка на изменения в облаке (синхронизация между пользователями)
+  useEffect(() => {
+    try {
+      if (!settings?.supabaseUrl || !settings?.supabaseAnon) return;
+      const client = getSupabaseClient(settings);
+      if (!client) return;
+      const org = settings.org || 'default';
+      const channel = client.channel('nd_state_sync');
+      channel.on('postgres_changes', { event: '*', schema: 'public', table: 'nd_state', filter: `org=eq.${org}` }, (payload) => {
+        try {
+          const row = payload.new || payload.record || {};
+          const updatedAt = row.updated_at || payload.commit_timestamp || new Date().toISOString();
+          const blob = row.blob || null;
+          if (!blob) return;
+          if (blob.clientId && blob.clientId === clientIdRef.current) return; // ignore self
+          if (lastCloudAppliedRef.current && new Date(updatedAt) <= new Date(lastCloudAppliedRef.current)) return; // stale
+          // apply incoming state
+          setRawItems(Array.isArray(blob.rawItems)? blob.rawItems : []);
+          setModels(Array.isArray(blob.models)? blob.models : []);
+          setJewelryStock(Array.isArray(blob.jewelryStock)? blob.jewelryStock : []);
+          setOrders(Array.isArray(blob.orders)? blob.orders : []);
+          setLedger(Array.isArray(blob.ledger)? blob.ledger : []);
+          setSuppliers(Array.isArray(blob.suppliers)? blob.suppliers : []);
+          setServices(Array.isArray(blob.services)? blob.services : services);
+          setPOs(Array.isArray(blob.pos)? blob.pos : []);
+          setSettings(prev => ({ ...prev, ...(blob.settings||{}) }));
+          lastCloudAppliedRef.current = updatedAt;
+          showToast('Изменения получены из облака', 'info');
+        } catch (e) { console.warn('rt-apply failed', e); }
+      });
+      const sub = channel.subscribe(() => {});
+      return () => { try { client.removeChannel(channel); } catch {} };
+    } catch (e) { console.warn('realtime-subscribe failed', e); }
+  }, [settings.supabaseUrl, settings.supabaseAnon, settings.org]);
 
   return { rawItems, setRawItems, models, setModels, jewelryStock, setJewelryStock, orders, setOrders, ledger, setLedger, settings, setSettings, suppliers, setSuppliers, services, setServices, users, setUsers, pos, setPOs, resetAll, exportJSON, importJSON };
 }
@@ -4041,6 +4085,8 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
                   pos: loadLS('nd_pos', []),
                   services: loadLS('nd_services', []),
                   savedAt: new Date().toISOString(),
+                  clientId: loadLS('nd_client_id', null),
+                  org: settings.org||'default',
                 };
                 const { error } = await client.from('nd_state').upsert({ org: settings.org||'default', blob, updated_at: new Date().toISOString() });
                 if (error) throw error; showToast('Сохранено в облако', 'success');
