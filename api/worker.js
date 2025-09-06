@@ -3,6 +3,10 @@ export default {
     try {
       const url = new URL(request.url);
       const { pathname } = url;
+      // CORS preflight
+      if (request.method === 'OPTIONS') {
+        return new Response(null, { status: 204, headers: corsHeaders() });
+      }
       if (pathname === '/api/health') {
         return json({ ok: true, ts: new Date().toISOString() });
       }
@@ -17,7 +21,7 @@ export default {
         const body = await safeJson(request);
         return json({ ok: true, echo: body||null });
       }
-      return new Response('Not Found', { status: 404 });
+      return new Response('Not Found', { status: 404, headers: corsHeaders() });
     } catch (e) {
       return json({ ok: false, error: String(e?.message || e) }, 500);
     }
@@ -27,12 +31,20 @@ export default {
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'content-type': 'application/json; charset=utf-8', ...headers }
+    headers: { 'content-type': 'application/json; charset=utf-8', ...corsHeaders(), ...headers }
   });
 }
 
 async function safeJson(request) {
   try { return await request.json(); } catch { return null; }
+}
+
+function corsHeaders() {
+  return {
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET,POST,OPTIONS',
+    'access-control-allow-headers': 'content-type'
+  };
 }
       if (pathname === '/api/telegram/notify' && request.method === 'POST') {
         const body = await safeJson(request) || {};
