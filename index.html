@@ -927,7 +927,7 @@ function NeoDiamondWMS() {
       if (s==='reorder') return <Section title="Рекомендации закупок"><ReorderRecommendations settings={settings} /></Section>;
     }
     if (section==='settings') return <Backup exportJSON={exportJSON} importJSON={importJSON} resetAll={resetAll} settings={settings} setSettings={setSettings} users={users} setUsers={setUsers} />;
-    if (section==='profile') return <Profile users={users} setUsers={setUsers} session={session} onLogout={()=>{ setSession(null); setSettings({ ...settings, role:'manager' }); }} />;
+    if (section==='profile') return <Profile users={users} setUsers={setUsers} session={session} onLogout={()=>{ setSession(null); setSettings({ ...settings, role:'manager' }); }} settings={settings} setSettings={setSettings} />;
     return null;
   };
 
@@ -1059,7 +1059,7 @@ function LoginScreen({ users, onCreateAdmin, onLogin, onSetPassword }){
   );
 }
 
-function Profile({ users, setUsers, session, onLogout }){
+function Profile({ users, setUsers, session, onLogout, settings, setSettings }){
   const me = users?.find?.(u=> u.username === (session?.username||''));
   const [p1, setP1] = React.useState('');
   const [p2, setP2] = React.useState('');
@@ -1100,6 +1100,25 @@ function Profile({ users, setUsers, session, onLogout }){
           <Button variant="outline" onClick={onLogout}>Выйти</Button>
         </div>
         <div className="text-xs text-slate-500 mt-3">Доступ к настройкам, складу и финансам ограничен для роли master.</div>
+      </Section>
+      <Section title="Уведомления (Telegram)">
+        <label className="inline-flex items-center gap-2 text-sm mb-3">
+          <input type="checkbox" checked={!!settings.notifyNewOrder} onChange={e=>setSettings({ ...settings, notifyNewOrder: e.target.checked })} />
+          <span>Отправлять уведомления о новых заказах</span>
+        </label>
+        <Input label="Chat ID или @channelusername" value={settings.tgChatId||''} onChange={e=>setSettings({ ...settings, tgChatId: e.target.value })} />
+        <Input label="API base URL (Workers)" value={settings.apiBaseUrl||''} onChange={e=>setSettings({ ...settings, apiBaseUrl: e.target.value })} />
+        <div className="flex items-center gap-2">
+          <Button variant="outline" onClick={async()=>{
+            try{
+              const base=(settings.apiBaseUrl||'').replace(/\/$/,'');
+              const url= base? `${base}/api/telegram/notify` : '/api/telegram/notify';
+              const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({text:'Тестовое уведомление Neo Diamond',chatId:settings.tgChatId||undefined})});
+              const j=await r.json(); if(!j.ok) throw new Error(j.error||'Ошибка'); showToast('Отправлено в Telegram','success');
+            }catch(e){ showToast('Ошибка Telegram: '+(e.message||e),'error'); }
+          }}><Icon name="send"/> Отправить тест</Button>
+        </div>
+        <div className="text-xs text-slate-500 mt-2">Токен бота хранится в Cloudflare Worker. Здесь укажите канал/чат и адрес воркера.</div>
       </Section>
     </div>
   );
