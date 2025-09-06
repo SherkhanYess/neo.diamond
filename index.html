@@ -1710,7 +1710,7 @@ function OrdersBoard({ store }) {
           onCancel={()=>{ const ord=orders.find(o=>o.id===detailsId); if(ord){ if (ord.consumedDiamonds) releaseDiamonds(ord, true); else releaseDiamonds(ord, false); } setOrders(os=> os.map(o=> o.id===detailsId? { ...o, status:'Отменён' } : o)); setDetailsId(null); }}
           onPayment={(amt,method,note,currency)=>addPayment(detailsId,amt,method,note,currency)}
           onPatchOrder={(id,patch)=> { const ord=orders.find(o=>o.id===id); if (patch?.archived && ord){ if (ord.consumedDiamonds) releaseDiamonds(ord, true); else releaseDiamonds(ord, false); } setOrders(os=> os.map(o=> o.id===id? { ...o, ...patch } : o)); }}
-          session={session}
+          session={loadLS('nd_session', null)}
         />
       )}
     </div>
