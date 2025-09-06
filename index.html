@@ -640,6 +640,22 @@ function modelCostBreakdown(model, rawItems, settings = defaultSettings, metalOv
   return { base, labor, metalAdd, plating, total };
 }
 
+// Фактическая себестоимость металлов из BOM (без бриллиантов)
+function metalCostFromBOM(model, rawItems, settings = defaultSettings) {
+  if (!model) return 0;
+  let sum = 0;
+  for (const b of (model.bom||[])) {
+    const r = rawItems.find(x => x.id === b.rawItemId);
+    if (!r) continue;
+    if (r.category !== 'Металл') continue;
+    const cur = r.currency || 'KZT';
+    const waste = b.wastePct ? (1 + b.wastePct) : 1;
+    const amt = (r.costPerUnit || 0) * (b.qty || 0) * waste;
+    sum += convert(amt, cur, settings.currency, settings.rates);
+  }
+  return sum;
+}
+
 // Потребление сырья из леджера (по RAW_OUT через BOM)
 function computeRawUsageByDay(ledger, models) {
   const map = {};
@@ -1158,16 +1174,16 @@ function MasterBoard({ store, session }){
   };
   const myOrders = orders.filter(o => o.assignedTo===me && (!q || (o.id||'').includes(q)));
   const unassigned = orders.filter(o => !o.assignedTo && allowSelf && (!q || (o.id||'').includes(q)));
-  const groups = {
-    'Неназначено': unassigned,
-    'В работе': myOrders.filter(o => (o.masterStatus||'')==='В работе'),
-    'На проверке': myOrders.filter(o => (o.masterStatus||'')==='На проверке'),
-    'Готово': myOrders.filter(o => (o.masterStatus||'')==='Готово'),
-  };
-  const columns = allowSelf? ['Неназначено','В работе','На проверке','Готово'] : ['В работе','На проверке','Готово'];
+  const groups = {};
+  const columns = STATUSES.slice();
+  // Новые заказы — неназначенные (для самоназначения)
+  groups['Новые заказы'] = allowSelf ? orders.filter(o => (!o.assignedTo) && (o.status||'')==='Новые заказы' && (!q || (o.id||'').includes(q))) : [];
+  for (const st of STATUSES.filter(s=> s!=='Новые заказы')) {
+    groups[st] = myOrders.filter(o => (o.status||'')===st);
+  }
   // Суммарные показатели
-  const earned = myOrders.filter(o => (o.masterStatus||'')==='Готово').reduce((s,o)=> s + (o.lines||[]).reduce((x,l)=> x + pieceRate(l.modelId)*(l.qty||1), 0), 0);
-  const available = myOrders.filter(o => (o.masterStatus||'')!=='Готово').reduce((s,o)=> s + (o.lines||[]).reduce((x,l)=> x + pieceRate(l.modelId)*(l.qty||1), 0), 0);
+  const earned = myOrders.filter(o => ['Доставлено','Завершено'].includes(o.status||'')).reduce((s,o)=> s + (o.lines||[]).reduce((x,l)=> x + pieceRate(l.modelId)*(l.qty||1), 0), 0);
+  const available = myOrders.filter(o => !['Доставлено','Завершено'].includes(o.status||'')).reduce((s,o)=> s + (o.lines||[]).reduce((x,l)=> x + pieceRate(l.modelId)*(l.qty||1), 0), 0);
   const card = (o) => {
     const first = (o.lines||[])[0];
     const m = models.find(mm=>mm.id===first?.modelId);
@@ -1182,9 +1198,12 @@ function MasterBoard({ store, session }){
         {o.note && <div className="text-xs text-slate-500 mt-1 whitespace-pre-wrap">{o.note}</div>}
         <div className="flex items-center gap-2 mt-2">
           {!o.assignedTo && allowSelf && <Button onClick={()=>takeInWork(o)}><Icon name="check"/> Взять в работу</Button>}
-          {o.assignedTo===me && (o.masterStatus!=='В работе') && <Button variant="outline" onClick={()=>setStatus(o,'В работе')}>В работу</Button>}
-          {o.assignedTo===me && (o.masterStatus==='В работе') && <Button variant="outline" onClick={()=>setStatus(o,'На проверке')}>На проверке</Button>}
-          {o.assignedTo===me && (o.masterStatus==='На проверке') && <Button variant="success" onClick={()=>setStatus(o,'Готово')}>Готово</Button>}
+          {o.assignedTo===me && (()=>{ const idx=STATUSES.indexOf(o.status||'Новые заказы'); const prev=STATUSES[idx-1]; const next=STATUSES[idx+1]; return (
+            <>
+              {prev && prev!=='Новые заказы' && <Button variant="outline" onClick={()=>setStatus(o, prev)}><Icon name="arrowL"/> Назад</Button>}
+              {next && <Button variant="success" onClick={()=>setStatus(o, next)}>Далее <Icon name="arrowR"/></Button>}
+            </>
+          ); })()}
           <Button variant="ghost" onClick={()=>setDetailsId(o.id)}>Подробнее</Button>
         </div>
       </div>
@@ -1208,7 +1227,7 @@ function MasterBoard({ store, session }){
           <div key={st} className="min-w-[320px] bg-white rounded-2xl border border-slate-200 p-3">
             <div className="flex items-center justify-between mb-2">
               <div className="font-bold">{st}</div>
-              <Badge color={st==='Готово'? 'green': st==='На проверке'? 'blue': st==='В работе'? 'yellow':'gray'}>{(groups[st]||[]).length}</Badge>
+              <Badge color={st==='Завершено'? 'green': st==='Доставлено'? 'blue': st==='Взят в работу'? 'yellow':'gray'}>{(groups[st]||[]).length}</Badge>
             </div>
             <div className="space-y-3">
               {(groups[st]||[]).map(card)}
@@ -1665,7 +1684,7 @@ function OrderDetailsModal({ order, models, settings, ledger, onClose, onCancel,
           <table className="w-full text-sm">
             <thead><tr className="text-left text-slate-500"><th className="py-2">Модель</th><th>Параметры</th><th className="text-right">Кол-во</th>{perms.financeView && <th className="text-right">Сумма</th>}</tr></thead>
             <tbody>
-              {(order.lines||[]).map(l=>{ const m=models.find(mm=>mm.id===l.modelId); const v = m? getVariant(m, l.metal||m.defaultMetal, l.color||m.defaultColor): null; const br = m? modelCostBreakdown(m, loadLS('nd_raw',[]), settings, l.metal||m?.defaultMetal, l.color||m?.defaultColor): {base:0, labor:0, metalAdd:0, plating:0, total:0}; const metalCost = (br.metalAdd + br.plating) * (l.qty||1); const earn = pieceRate(l.modelId) * (l.qty||1); const bom = (m?.bom||[]).map(b=>{ const r=loadLS('nd_raw',[]).find(x=>x.id===b.rawItemId); return { name:r?.name||'—', qty:(b.qty||0)*(l.qty||1) }; }); return (
+              {(order.lines||[]).map(l=>{ const m=models.find(mm=>mm.id===l.modelId); const v = m? getVariant(m, l.metal||m.defaultMetal, l.color||m.defaultColor): null; const br = m? modelCostBreakdown(m, loadLS('nd_raw',[]), settings, l.metal||m?.defaultMetal, l.color||m?.defaultColor): {base:0, labor:0, metalAdd:0, plating:0, total:0}; const metalBase = m? metalCostFromBOM(m, loadLS('nd_raw',[]), settings) : 0; const metalCost = (metalBase + br.plating) * (l.qty||1); const earn = pieceRate(l.modelId) * (l.qty||1); const bom = (m?.bom||[]).map(b=>{ const r=loadLS('nd_raw',[]).find(x=>x.id===b.rawItemId); return { name:r?.name||'—', qty:(b.qty||0)*(l.qty||1) }; }); return (
                 <React.Fragment key={l.id}>
                   <tr className="border-t border-slate-100">
                     <td className="py-2 font-medium">{m?.name}</td>
@@ -2462,7 +2481,7 @@ function ModelsBOM({ models, setModels, rawItems, settings }) {
             {isMaster ? (
               <div className="grid grid-cols-3 gap-3 mt-3">
                 <div><div className="text-xs text-slate-500">Работа (ставка)</div><div className="font-semibold">{moneyFmt(pieceRateFor(m.id), settings.currency)}</div></div>
-                <div><div className="text-xs text-slate-500">Металл</div><div className="font-semibold">{moneyFmt(br.metalAdd + br.plating, settings.currency)}</div></div>
+                <div><div className="text-xs text-slate-500">Металл</div><div className="font-semibold">{moneyFmt(metalCostFromBOM(m, rawItems, settings) + br.plating, settings.currency)}</div></div>
                 <div></div>
               </div>
             ) : (
@@ -2552,14 +2571,14 @@ function ModelsBOM({ models, setModels, rawItems, settings }) {
                 <div className="text-slate-500 text-sm mb-2">{m.type} · {v.metal}/{color}</div>
                 {isMaster ? (
                   <div className="grid grid-cols-3 gap-3">
-                    {(() => { const br=modelCostBreakdown(m, rawItems, settings, v.metal, color); const pr=(()=>{ const r=+(m?.pieceRate||0); const cur=m?.pieceCurrency||'KZT'; return convert(r, cur, settings.currency, settings.rates); })(); return <>
+                    {(() => { const br=modelCostBreakdown(m, rawItems, settings, v.metal, color); const pr=(()=>{ const r=+(m?.pieceRate||0); const cur=m?.pieceCurrency||'KZT'; return convert(r, cur, settings.currency, settings.rates); })(); const metal = metalCostFromBOM(m, rawItems, settings) + br.plating; return <>
                       <div>
                         <div className="text-xs text-slate-500">Работа (ставка)</div>
                         <div className="font-semibold">{moneyFmt(pr, settings.currency)}</div>
                       </div>
                       <div>
                         <div className="text-xs text-slate-500">Металл</div>
-                        <div className="font-semibold">{moneyFmt(br.metalAdd + br.plating, settings.currency)}</div>
+                        <div className="font-semibold">{moneyFmt(metal, settings.currency)}</div>
                       </div>
                       <div></div>
                     </>; })()}
@@ -2611,9 +2630,9 @@ function ModelsBOM({ models, setModels, rawItems, settings }) {
                   <td>{v.metal}</td>
                   <td>{m.type}</td>
                   {isMaster ? (
-                    (() => { const br=modelCostBreakdown(m, rawItems, settings, v.metal, v.color); const pr=(()=>{ const r=+(m?.pieceRate||0); const cur=m?.pieceCurrency||'KZT'; return convert(r, cur, settings.currency, settings.rates); })(); const bomTxt=(m.bom||[]).map(b=>{ const r=rawItems.find(x=>x.id===b.rawItemId); return `${r?.name||'—'} × ${fmt.format(b.qty||0)}`; }).join('; '); return <>
+                    (() => { const br=modelCostBreakdown(m, rawItems, settings, v.metal, v.color); const pr=(()=>{ const r=+(m?.pieceRate||0); const cur=m?.pieceCurrency||'KZT'; return convert(r, cur, settings.currency, settings.rates); })(); const bomTxt=(m.bom||[]).map(b=>{ const r=rawItems.find(x=>x.id===b.rawItemId); return `${r?.name||'—'} × ${fmt.format(b.qty||0)}`; }).join('; '); const metal = metalCostFromBOM(m, rawItems, settings) + br.plating; return <>
                       <td className="text-right">{moneyFmt(pr, settings.currency)}</td>
-                      <td className="text-right">{moneyFmt(br.metalAdd + br.plating, settings.currency)}</td>
+                      <td className="text-right">{moneyFmt(metal, settings.currency)}</td>
                       <td className="text-xs text-slate-600">{bomTxt||'—'}</td>
                       <td className="text-right"></td>
                     </>; })()
