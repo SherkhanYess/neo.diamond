@@ -39,6 +39,7 @@ async function safeJson(request) {
   try { return await request.json(); } catch { return null; }
 }
 
+<<<<<<< ours
 function corsHeaders() {
   return {
     'access-control-allow-origin': '*',
@@ -66,3 +67,5 @@ function corsHeaders() {
         }
         return json({ ok:true, result: data.result?.message_id || null });
       }
+=======
+>>>>>>> theirs
