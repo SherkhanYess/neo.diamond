@@ -61,7 +61,7 @@ create policy "nd_state_update" on public.nd_state for update using ( true );
 
 ## Интеграции и бекэнд
 - Для финансов "Финолог" запланирован через serverless-функции/прокси. Рекомендован подход: Cloudflare Workers/Netlify Functions/Vercel Functions (секреты на сервере, не в браузере).
-- В этом репо пока настроен только фронтенд и облачный бэкап через Supabase (без собственного кода сервера) — этого достаточно, чтобы избежать проблем localStorage.
+- Реализован API‑мост (Cloudflare Workers) между WMS и интернет‑магазином. Поддерживаются каталоги, остатки и вебхуки заказов.
 
 Если хотите, могу добавить:
 - Выгрузку фото в Supabase Storage (URL вместо data URI) с автоподстановкой.
@@ -73,3 +73,30 @@ create policy "nd_state_update" on public.nd_state for update using ( true );
 
 ---
 Вопросы/пожелания — в Issues или пишите мне. 🚀
+
+## API‑мост для интернет‑магазина (черновик)
+
+Бэк: `api/worker.js` (Cloudflare Workers). Секреты на стороне воркера.
+
+Переменные окружения воркера (Wrangler → Vars):
+- `WMS_SUPABASE_URL` — Supabase URL вашего онлайн‑склада
+- `WMS_SUPABASE_SERVICE_KEY` — service role key (хранить только на сервере)
+- `SHOP_WEBHOOK_SECRET` — секрет для подписи вебхуков магазина (HMAC‑SHA256)
+- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` — (опционально) для уведомлений
+
+Эндпоинты (MVP):
+- GET `/api/catalog?org=default`
+  - Ответ: `{ ok, org, updatedAt, products: [{ id, name, type, variants:[{ id, metal, color, price, currency, stockQty }] }] }`
+- GET `/api/inventory?org=default`
+  - Ответ: `{ ok, org, updatedAt, inventory:[{ modelId, metal, color, qty }] }`
+- GET `/api/orders?org=default&since=ISO`
+  - Ответ: `{ ok, org, count, orders:[...] }`
+- POST `/api/shop/orders/webhook?org=default`
+  - Вход: `{ externalId, customer, lines:[{ modelId?, sku?, metal, color, qty, price?, currency? }], note?, produceFromRaw? }`
+  - Действие: создаёт заказ в WMS (резервирует бриллианты), возвращает `{ ok, id }`
+  - Безопасность: заголовок `X-Shop-Signature: sha256=<hex>` (по `SHOP_WEBHOOK_SECRET`)
+- POST `/api/shop/orders/status?org=default`
+  - Вход: `{ externalId, status }` где status ∈ { created, paid, in_progress, fulfilled, delivered, completed, cancelled }
+  - Действие: обновление статуса заказа в WMS
+
+Источник данных — таблица `public.nd_state` (единый JSON‑снимок), поэтому изменения видны всем ролям/пользователям и отдаются магазину. Для поэтапной эволюции можно перейти на нормализованные таблицы (`products`, `variants`, `inventory`, `orders`, ...).
