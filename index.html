@@ -145,6 +145,23 @@ const servicePrice = (name, settings=defaultSettings) => {
 const moneyFmt = (amount, currency='KZT') => new Intl.NumberFormat('ru-RU', { style:'currency', currency, maximumFractionDigits: 0 }).format(+amount||0);
 const moneyDisplay = (amount, fromCurrency='KZT', settings=defaultSettings) => moneyFmt(convert(amount, fromCurrency, settings.currency, settings.rates), settings.currency);
 
+// Нормализация base URL воркера: убираем конечный слэш и случайно вставленный "/api/..."
+function normalizeApiBase(url){
+  try{
+    if(!url) return '';
+    let s = String(url).trim();
+    // remove query/fragment
+    s = s.replace(/[#?].*$/, '');
+    // remove trailing slash
+    s = s.replace(/\/$/, '');
+    // if someone pasted .../api/health or .../api, cut at /api
+    const ix = s.indexOf('/api/');
+    if (ix > -1) s = s.slice(0, ix);
+    else if (s.endsWith('/api')) s = s.slice(0, -4);
+    return s;
+  }catch{ return url; }
+}
+
 // Услуги (работы): отдельная сущность
 const seedServices = () => ([
   { id: uid(), name: 'Работа цеха', price: 10000, currency: 'KZT' },
@@ -1264,24 +1281,45 @@ function ReorderRecommendations({ settings }) {
 
 // ------- Вид мастера: Канбан -------
 function MasterBoard({ store, session }){
-  const { orders, setOrders, models, settings, ledger } = store;
-  const me = session?.username || '';
+  const { orders, setOrders, models, settings, ledger, rawItems, setRawItems } = store;
   const allowSelf = !!(settings?.allowSelfAssignMaster);
   const [q, setQ] = React.useState('');
   const [detailsId, setDetailsId] = React.useState(null);
   const pieceRate = (mid)=>{ const m=models.find(x=>x.id===mid); const r=+(m?.pieceRate||0); const cur=m?.pieceCurrency||'KZT'; return convert(r, cur, settings.currency, settings.rates); };
 
+  // Helpers to consume reserved diamonds when entering work
+  const diamondLines = (model, qty) => {
+    const list = [];
+    (model?.bom||[]).forEach(b => { const r = (rawItems||[]).find(x=>x.id===b.rawItemId); if (r && r.category==='Бриллиант') list.push({ rawId:r.id, qty:(b.qty||0)*(qty||1) }); });
+    return list;
+  };
+  const consumeFromReserve = (order) => {
+    const mutations = {};
+    (order.lines||[]).forEach(l => { const m=models.find(mm=>mm.id===l.modelId); diamondLines(m, l.qty).forEach(x=>{ mutations[x.rawId]=(mutations[x.rawId]||0)+x.qty; }); });
+    setRawItems(items => items.map(r => mutations[r.id]? { ...r, reservedQty: Math.max(0, (r.reservedQty||0) - mutations[r.id]), stockQty: Math.max(0, (r.stockQty||0) - mutations[r.id]) } : r));
+  };
+
   const setOrderPatch = (id, patch) => setOrders((os)=> os.map(o => o.id===id? { ...o, ...patch } : o));
   const takeInWork = (o) => {
     if (!allowSelf) return;
-    if (o.assignedTo && o.assignedTo!==me) return;
     const now = new Date().toISOString();
-    setOrderPatch(o.id, { assignedTo: me, masterStatus: 'В работе', workStartedAt: (o.workStartedAt||now) });
+    // Move to board status "Взят в работу" and consume reserved diamonds once
+    setOrders(os => os.map(x => {
+      if (x.id!==o.id) return x;
+      if ((x.status||'') !== 'Взят в работу') {
+        consumeFromReserve(x); x.consumedDiamonds = true;
+      }
+      return { ...x, status: 'Взят в работу', workStartedAt: (x.workStartedAt||now) };
+    }));
   };
   const setStatus = (o, status) => {
-    const patch = { masterStatus: status };
-    if (status==='Готово') patch.workCompletedAt = new Date().toISOString();
-    setOrderPatch(o.id, patch);
+    setOrders(os => os.map(x => {
+      if (x.id!==o.id) return x;
+      if (status==='Взят в работу' && (x.status||'')!=='Взят в работу') { consumeFromReserve(x); x.consumedDiamonds = true; }
+      const patch = { status };
+      if (status==='Готово') patch.workCompletedAt = new Date().toISOString();
+      return { ...x, ...patch };
+    }));
   };
   const prioBadge = (p) => {
     const map = { 'Низкий':'gray', 'Обычный':'blue', 'Высокий':'yellow', 'Срочно':'red' };
@@ -1292,18 +1330,17 @@ function MasterBoard({ store, session }){
     const color = days<0? 'red' : days<=1? 'yellow' : 'green';
     return <Badge color={color}>{dd.toLocaleDateString('ru-RU')}</Badge>;
   };
-  const myOrders = orders.filter(o => o.assignedTo===me && (!q || (o.id||'').includes(q)));
-  const unassigned = orders.filter(o => !o.assignedTo && allowSelf && (!q || (o.id||'').includes(q)));
   const groups = {};
   const columns = STATUSES.slice();
-  // Новые заказы — неназначенные (для самоназначения)
-  groups['Новые заказы'] = allowSelf ? orders.filter(o => (!o.assignedTo) && (o.status||'')==='Новые заказы' && (!q || (o.id||'').includes(q))) : [];
-  for (const st of STATUSES.filter(s=> s!=='Новые заказы')) {
-    groups[st] = myOrders.filter(o => (o.status||'')===st);
+  // Показываем все заказы по статусам, без привязки к мастеру
+  for (const st of STATUSES) {
+    groups[st] = orders.filter(o => (o.status||'')===st && (!q || (o.id||'').includes(q)));
   }
-  // Суммарные показатели
-  const earned = myOrders.filter(o => ['Доставлено','Завершено'].includes(o.status||'')).reduce((s,o)=> s + (o.lines||[]).reduce((x,l)=> x + pieceRate(l.modelId)*(l.qty||1), 0), 0);
-  const available = myOrders.filter(o => !['Доставлено','Завершено'].includes(o.status||'')).reduce((s,o)=> s + (o.lines||[]).reduce((x,l)=> x + pieceRate(l.modelId)*(l.qty||1), 0), 0);
+  // Суммарные показатели по всем активным заказам
+  const earned = orders.filter(o => ['Доставлено','Завершено'].includes(o.status||''))
+    .reduce((s,o)=> s + (o.lines||[]).reduce((x,l)=> x + pieceRate(l.modelId)*(l.qty||1), 0), 0);
+  const available = orders.filter(o => !['Доставлено','Завершено'].includes(o.status||''))
+    .reduce((s,o)=> s + (o.lines||[]).reduce((x,l)=> x + pieceRate(l.modelId)*(l.qty||1), 0), 0);
   const card = (o) => {
     const first = (o.lines||[])[0];
     const m = models.find(mm=>mm.id===first?.modelId);
@@ -1317,8 +1354,8 @@ function MasterBoard({ store, session }){
         <div className="text-sm text-slate-600">{first?.metal||m?.defaultMetal} · {first?.color||m?.defaultColor} · {first?.qty||1} шт</div>
         {o.note && <div className="text-xs text-slate-500 mt-1 whitespace-pre-wrap">{o.note}</div>}
         <div className="flex items-center gap-2 mt-2">
-          {!o.assignedTo && allowSelf && <Button onClick={()=>takeInWork(o)}><Icon name="check"/> Взять в работу</Button>}
-          {o.assignedTo===me && (()=>{ const idx=STATUSES.indexOf(o.status||'Новые заказы'); const prev=STATUSES[idx-1]; const next=STATUSES[idx+1]; return (
+          {allowSelf && (o.status||'')==='Новые заказы' && <Button onClick={()=>takeInWork(o)}><Icon name="check"/> Взять в работу</Button>}
+          {(()=>{ const idx=STATUSES.indexOf(o.status||'Новые заказы'); const prev=STATUSES[idx-1]; const next=STATUSES[idx+1]; return (
             <>
               {prev && prev!=='Новые заказы' && <Button variant="outline" onClick={()=>setStatus(o, prev)}><Icon name="arrowL"/> Назад</Button>}
               {next && <Button variant="success" onClick={()=>setStatus(o, next)}>Далее <Icon name="arrowR"/></Button>}
@@ -1660,7 +1697,7 @@ function OrdersBoard({ store }) {
           `Позиции:\\n${linesText}`
         ].filter(Boolean);
         const text = parts.join('\\n');
-        const base = (settings.apiBaseUrl||'').replace(/\/$/, '');
+        const base = normalizeApiBase(settings.apiBaseUrl||'');
         const url = base? `${base}/api/telegram/notify` : '/api/telegram/notify';
         fetch(url, { method:'POST', headers:{ 'content-type':'application/json' }, body: JSON.stringify({ text, chatId: settings.tgChatId||undefined, parse_mode:'HTML' }) }).catch(()=>{});
       }
@@ -3935,7 +3972,7 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
             <Input label="API base URL (Workers)" value={settings.apiBaseUrl||''} onChange={e=>setSettings({ ...settings, apiBaseUrl: e.target.value })} />
             <div className="flex items-center gap-2">
               <Button variant="outline" onClick={async()=>{
-                try{ const base=(settings.apiBaseUrl||'').replace(/\/$/,''); const url= base? `${base}/api/telegram/notify` : '/api/telegram/notify'; const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({text:'Тестовое уведомление Neo Diamond',chatId:settings.tgChatId||undefined})}); const j=await r.json(); if(!j.ok) throw new Error(j.error||'Ошибка'); showToast('Отправлено в Telegram','success'); }catch(e){ showToast('Ошибка Telegram: '+(e.message||e),'error'); }
+                try{ const base=normalizeApiBase(settings.apiBaseUrl||''); const url= base? `${base}/api/telegram/notify` : '/api/telegram/notify'; const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({text:'Тестовое уведомление Neo Diamond',chatId:settings.tgChatId||undefined})}); const j=await r.json(); if(!j.ok) throw new Error(j.error||'Ошибка'); showToast('Отправлено в Telegram','success'); }catch(e){ showToast('Ошибка Telegram: '+(e.message||e),'error'); }
               }}><Icon name="send"/> Отправить тест</Button>
             </div>
             <div className="text-xs text-slate-500">Токен бота хранится в Cloudflare Worker. Здесь укажите канал/чат и адрес воркера.</div>
