@@ -4103,6 +4103,45 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
                 showToast('Загружено из облака ('+ new Date(data.updated_at).toLocaleString('ru-RU') +')', 'success');
               } catch (e) { console.error(e); showToast('Ошибка загрузки: ' + (e.message||e), 'danger'); }
             }}>Загрузить из облака</Button>
+            <Button variant="danger" onClick={()=>{
+              if (!confirm('Удалить ВСЕ заказы и вернуть все бриллианты на склад?')) return;
+              try {
+                const ordersList = loadLS('nd_orders', []);
+                const modelsList = loadLS('nd_models', []);
+                const rawList = loadLS('nd_raw', []);
+                const diamondMap = {};
+                // Считаем возврат бриллиантов по всем заказам
+                for (const o of (ordersList||[])) {
+                  for (const l of (o.lines||[])) {
+                    const m = modelsList.find(mm=>mm.id===l.modelId);
+                    for (const b of (m?.bom||[])) {
+                      const r = rawList.find(x=>x.id===b.rawItemId);
+                      if (!r || r.category !== 'Бриллиант') continue;
+                      const qty = (b.qty||0) * (l.qty||1);
+                      const rec = diamondMap[r.id] || { stockDelta:0, reservedDelta:0 };
+                      if (o.consumedDiamonds) rec.stockDelta += qty; else rec.reservedDelta -= qty;
+                      diamondMap[r.id] = rec;
+                    }
+                  }
+                }
+                // Обновляем склад сырья
+                const rawUpd = rawList.map(r => {
+                  const d = diamondMap[r.id]; if (!d) return r;
+                  return { ...r, stockQty: Math.max(0, (r.stockQty||0) + (d.stockDelta||0)), reservedQty: Math.max(0, (r.reservedQty||0) + (d.reservedDelta||0)) };
+                });
+                // Чистим заказы и проводки, связанные с ними
+                const toDeleteIds = new Set((ordersList||[]).map(o=>o.id));
+                const ledgerUpd = (loadLS('nd_ledger', [])||[]).filter(l => !toDeleteIds.has(l.refId));
+                // Сохраняем и синхронизируем состояние
+                saveLS('nd_raw', rawUpd);
+                saveLS('nd_orders', []);
+                saveLS('nd_ledger', ledgerUpd);
+                setRawItems(rawUpd);
+                setOrders([]);
+                setLedger(ledgerUpd);
+                showToast('Заказы удалены, бриллианты возвращены на склад', 'success');
+              } catch (e) { console.error(e); showToast('Ошибка операции: ' + (e.message||e), 'danger'); }
+            }}>Очистить заказы и вернуть бриллианты</Button>
             <Button variant="outline" onClick={async()=>{
               try {
                 const client = getSupabaseClient(settings);
