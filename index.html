@@ -297,6 +297,18 @@ function useStore() {
     setRawItems(items => items.filter(r=> r.category!=='Работа'));
     // ensure suppliers seed exists
     setSuppliers(s => (Array.isArray(s) && s.length>0) ? s : seedSuppliers());
+    // Cleanup ledger: drop entries tied to отменён/архив заказам (старые версии)
+    setLedger(l => {
+      try{
+        const ordersLS = loadLS('nd_orders', []);
+        return (l||[]).filter(ent => {
+          const ref = ent.refId; if (!ref) return true;
+          const o = (ordersLS||[]).find(x=>x.id===ref);
+          if (!o) return true;
+          return !(o.archived || o.status==='Отменён');
+        });
+      }catch{ return l; }
+    });
     saveVersion(SCHEMA_VERSION);
   }, []);
 
@@ -673,8 +685,16 @@ function metalCostFromBOM(model, rawItems, settings = defaultSettings) {
 function computeRawUsageByDay(ledger, models) {
   const map = {};
   const findModelByName = (name) => models.find(m => m.name === name);
+  const ordersLS = loadLS('nd_orders', []);
+  const isValidRef = (refId) => {
+    if (!refId) return true;
+    const o = ordersLS.find(x=>x.id===refId);
+    if (!o) return true;
+    return !(o.archived || o.status==='Отменён');
+  };
   for (const l of ledger) {
     if (l.type !== 'RAW_OUT') continue;
+    if (!isValidRef(l.refId)) continue;
     const d = (l.date||'').slice(0,10);
     const m = findModelByName(l.payload?.model || '');
     const qty = l.payload?.qty || 0;
@@ -3509,8 +3529,15 @@ function AnalyticsCost({ models, rawItems, settings }) {
 // ------- Аналитика: Выручка -------
 function AnalyticsRevenue({ ledger, settings }) {
   const byDay = useMemo(()=>{
+    const ordersLS = loadLS('nd_orders', []);
+    const validPayment = (p) => {
+      const oid = p.refId; if (!oid) return true;
+      const o = ordersLS.find(x=>x.id===oid);
+      if (!o) return true;
+      return !(o.archived || o.status==='Отменён');
+    };
     const map = {};
-    ledger.filter(l=>l.type==='PAYMENT').forEach(p=>{ const d=p.date.slice(0,10); map[d]=(map[d]||0)+convert(p.payload.amount,p.payload.currency||'KZT',settings.currency,settings.rates); });
+    ledger.filter(l=>l.type==='PAYMENT' && validPayment(l)).forEach(p=>{ const d=p.date.slice(0,10); map[d]=(map[d]||0)+convert(p.payload.amount,p.payload.currency||'KZT',settings.currency,settings.rates); });
     return Object.entries(map).sort(([a],[b])=>a.localeCompare(b));
   }, [ledger, settings]);
   return (
@@ -3537,13 +3564,13 @@ function AnalyticsABCXYZ({ models, orders, settings }) {
     return [from, to];
   }, [range, customFrom, customTo]);
   const salesMap = useMemo(()=>{
-    const map = {}; (orders||[]).filter(o=> o.type==='Клиентский' && new Date(o.createdAt)>=fromDate && new Date(o.createdAt)<=toDate).forEach(o=>{
+    const map = {}; (orders||[]).filter(o=> o.type==='Клиентский' && !o.archived && o.status!=='Отменён' && new Date(o.createdAt)>=fromDate && new Date(o.createdAt)<=toDate).forEach(o=>{
       (o.lines||[]).forEach(l=>{ map[l.modelId] = (map[l.modelId]||0) + (l.qty||0); });
     }); return map;
   }, [orders, fromDate, toDate]);
   const horizon = Math.max(1, Math.ceil((toDate - fromDate)/(1000*60*60*24)));
   const dailyByModel = useMemo(()=>{
-    const map = {}; (orders||[]).filter(o=> o.type==='Клиентский' && new Date(o.createdAt)>=fromDate && new Date(o.createdAt)<=toDate).forEach(o=>{
+    const map = {}; (orders||[]).filter(o=> o.type==='Клиентский' && !o.archived && o.status!=='Отменён' && new Date(o.createdAt)>=fromDate && new Date(o.createdAt)<=toDate).forEach(o=>{
       const d = new Date(o.createdAt).toISOString().slice(0,10); (o.lines||[]).forEach(l=>{ (map[l.modelId]=map[l.modelId]||{})[d] = ((map[l.modelId]||{})[d]||0) + (l.qty||0); });
     }); return map;
   }, [orders, fromDate, toDate]);
@@ -3638,7 +3665,7 @@ function AnalyticsStockDaysModels({ models, jewelryStock, orders }) {
   }, [jewelryStock]);
   const days = 90; const since = new Date(); since.setDate(since.getDate()-days);
   const dailySales = React.useMemo(()=>{
-    const map = {}; (orders||[]).filter(o=>o.type==='Клиентский' && new Date(o.createdAt)>=since).forEach(o=>{ (o.lines||[]).forEach(l=>{ map[l.modelId]=(map[l.modelId]||0)+(l.qty||0); }); }); Object.keys(map).forEach(k=>{ map[k]=map[k]/days; }); return map;
+    const map = {}; (orders||[]).filter(o=>o.type==='Клиентский' && !o.archived && o.status!=='Отменён' && new Date(o.createdAt)>=since).forEach(o=>{ (o.lines||[]).forEach(l=>{ map[l.modelId]=(map[l.modelId]||0)+(l.qty||0); }); }); Object.keys(map).forEach(k=>{ map[k]=map[k]/days; }); return map;
   }, [orders]);
   const rows = Object.keys(modelStock).map(mid=>{
     const onHand=modelStock[mid]||0, demand=dailySales[mid]||0; const dos=demand>0?onHand/demand:Infinity; const name=(models.find(m=>m.id===mid)?.name)||'—'; return { name, dos };
