@@ -142,6 +142,25 @@ export default {
         const body = await safeJson(request);
         return json({ ok: true, echo: body||null });
       }
+      // Upsert full state via Worker (so we can fan-out webhooks)
+      if (pathname === '/api/state/upsert' && request.method === 'POST') {
+        const org = url.searchParams.get('org') || 'default';
+        const nextBlob = await safeJson(request);
+        if (!nextBlob || typeof nextBlob !== 'object') return json({ ok:false, error:'invalid_payload' }, 400);
+        const prev = await loadState(env, org);
+        const prevBlob = prev?.blob || {};
+        // Save new state first (source of truth)
+        await saveState(env, org, nextBlob);
+        // Compute diffs and notify shop
+        try {
+          const diffs = computeDiffs(prevBlob, nextBlob);
+          await notifyShop(env, diffs, org);
+        } catch (e) {
+          // Log but don't fail the request
+          console.warn('notifyShop error', e);
+        }
+        return json({ ok:true, org });
+      }
       return new Response('Not Found', { status: 404, headers: corsHeaders() });
     } catch (e) {
       return json({ ok: false, error: String(e?.message || e) }, 500);
@@ -195,19 +214,27 @@ function sbHeaders(env){
 function buildCatalog(blob){
   const models = Array.isArray(blob?.models)? blob.models : [];
   const jewelryStock = Array.isArray(blob?.jewelryStock)? blob.jewelryStock : [];
+  const rawItems = Array.isArray(blob?.rawItems)? blob.rawItems : [];
   const products = models.map(m => {
     const variants = (Array.isArray(m.variants) && m.variants.length>0)
       ? m.variants
       : buildVariantsFallback(m);
-    const list = variants.map(v => ({
-      id: v.id || `var-${m.id}-${(v.metal||m.defaultMetal)||'metal'}-${(v.color||m.defaultColor)||'color'}`,
-      metal: v.metal || m.defaultMetal || 'Золото',
-      color: v.color || m.defaultColor || 'Белый',
-      price: +v.salesPrice || +m.salesPrice || 0,
-      currency: v.salesCurrency || m.salesCurrency || 'KZT',
-      stockQty: sumStock(jewelryStock, m.id, v.metal||m.defaultMetal, v.color||m.defaultColor),
-    }));
-    return { id: m.id, sku: m.sku||null, name: m.name, type: m.type, active: m.active!==false, variants: list };
+    const list = variants.map(v => {
+      const metal = v.metal || m.defaultMetal || 'Золото';
+      const color = v.color || m.defaultColor || 'Белый';
+      return {
+        id: v.id || `var-${m.id}-${metal}-${color}`,
+        sku: v.sku || null,
+        metal,
+        color,
+        price: +v.salesPrice || +m.salesPrice || 0,
+        currency: v.salesCurrency || m.salesCurrency || 'KZT',
+        stockQty: sumStock(jewelryStock, m.id, metal, color),
+        photoUrl: getPhotoUrl(m, v, color) || null,
+      };
+    });
+    const bom = buildBOM(m, rawItems);
+    return { id: m.id, sku: m.sku||null, name: m.name, type: m.type, active: m.active!==false, photoUrl: m.photoUrl||null, bom, variants: list };
   });
   return { products };
 }
@@ -224,6 +251,19 @@ function sumStock(jewelryStock, modelId, metal, color){
 function buildInventory(blob){
   const jewelryStock = Array.isArray(blob?.jewelryStock)? blob.jewelryStock : [];
   return jewelryStock.map(j => ({ modelId: j.modelId, metal: j.metal, color: j.color, qty: j.qty||0 }));
+}
+function buildBOM(model, rawItems){
+  const out = [];
+  for (const b of (model?.bom||[])){
+    const r = rawItems.find(x=>x.id===b.rawItemId);
+    out.push({ rawItemId: b.rawItemId, name: r?.name||null, category: r?.category||null, unit: r?.unit||null, carat: r?.carat||null, metal: r?.metal||null, color: r?.color||null, qty: b.qty||0 });
+  }
+  return out;
+}
+function getPhotoUrl(model, variant, color){
+  const v = variant||{}; const m = model||{};
+  const byColorV = v.photosByColor||{}; const byColorM = m.photosByColor||{};
+  return byColorV[color] || v.photoUrl || byColorM[color] || m.photoUrl || null;
 }
 function resolveModelId(models, line){
   if (line.modelId) return line.modelId;
@@ -286,4 +326,63 @@ function uid(){
 function mapShopStatusToWms(s){
   const map = { created:'Новые заказы', paid:'Новые заказы', in_progress:'Взят в работу', fulfilled:'Доставлено', delivered:'Доставлено', completed:'Завершено', cancelled:'Отменён' };
   return map[s] || 'Новые заказы';
+}
+
+// ---------- Diff + Notifications ----------
+function computeDiffs(prev, next){
+  const diffs = { orders: [], inventory: [] };
+  // Orders status diff
+  const po = new Map((Array.isArray(prev?.orders)? prev.orders:[]).map(o=> [keyOrder(o), o]));
+  const no = new Map((Array.isArray(next?.orders)? next.orders:[]).map(o=> [keyOrder(o), o]));
+  for (const [k, n] of no){
+    const p = po.get(k); if (!p) continue;
+    if ((p.status||'') !== (n.status||'')) diffs.orders.push({ externalId: n.externalId||null, id: n.id, from: p.status||'', to: n.status||'', updatedAt: n.updatedAt||n.createdAt||null });
+  }
+  // Inventory diff
+  const pi = toInvMap(Array.isArray(prev?.jewelryStock)? prev.jewelryStock:[]);
+  const ni = toInvMap(Array.isArray(next?.jewelryStock)? next.jewelryStock:[]);
+  const all = new Set([...Object.keys(pi), ...Object.keys(ni)]);
+  for (const k of all){
+    const a = pi[k]||0, b = ni[k]||0; if (a!==b){ const [modelId, metal, color] = k.split('|'); diffs.inventory.push({ modelId, metal, color, from:a, to:b }); }
+  }
+  return diffs;
+}
+function keyOrder(o){ return (o.externalId||o.id||'')+''; }
+function toInvMap(list){
+  const m = {}; (list||[]).forEach(j=>{ const k=`${j.modelId}|${j.metal}|${j.color}`; m[k]=(m[k]||0)+(j.qty||0); }); return m;
+}
+async function notifyShop(env, diffs, org){
+  const statusUrl = env.SHOP_ORDERS_STATUS_URL || '';
+  const invUrl = env.SHOP_INVENTORY_URL || '';
+  const headers = await shopHeaders(env, null);
+  // Status changes
+  if (statusUrl && diffs.orders.length){
+    for (const ev of diffs.orders){
+      const body = JSON.stringify({ org, externalId: ev.externalId, wmsId: ev.id, status: mapWmsStatusToShop(ev.to), updatedAt: ev.updatedAt });
+      const h = await shopHeaders(env, body);
+      await fetch(statusUrl, { method:'POST', headers:h, body });
+    }
+  }
+  // Inventory changes (batch)
+  if (invUrl && diffs.inventory.length){
+    const body = JSON.stringify({ org, changes: diffs.inventory });
+    const h = await shopHeaders(env, body);
+    await fetch(invUrl, { method:'POST', headers:h, body });
+  }
+}
+function mapWmsStatusToShop(s){
+  const map = { 'Новые заказы':'created', 'Взят в работу':'in_progress', 'Доставлено':'delivered', 'Завершено':'completed', 'Отменён':'cancelled' };
+  return map[s] || 'created';
+}
+async function shopHeaders(env, bodyText){
+  const h = { 'content-type':'application/json' };
+  if (env.SHOP_API_KEY) h['authorization'] = `Bearer ${env.SHOP_API_KEY}`;
+  else if (env.SHOP_WEBHOOK_SECRET && bodyText){
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey('raw', enc.encode(env.SHOP_WEBHOOK_SECRET), { name:'HMAC', hash:'SHA-256' }, false, ['sign']);
+    const sig = await crypto.subtle.sign('HMAC', key, enc.encode(bodyText));
+    const hex = toHex(sig);
+    h['X-Shop-Signature'] = `sha256=${hex}`;
+  }
+  return h;
 }

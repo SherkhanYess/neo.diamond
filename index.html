@@ -445,11 +445,17 @@ function useStore() {
   // Автосинхронизация в Supabase (если включена)
   const autoCloudSave = React.useMemo(()=> debounce(async (payload)=>{
     try {
+      const base = normalizeApiBase(settings.apiBaseUrl||'');
+      const org = settings.org||'default';
+      if (base) {
+        await fetch(`${base}/api/state/upsert?org=${encodeURIComponent(org)}`, { method:'POST', headers:{ 'content-type':'application/json' }, body: JSON.stringify(payload) });
+        return;
+      }
       const client = getSupabaseClient(settings);
       if (!client) return;
-      await client.from('nd_state').upsert({ org: settings.org||'default', blob: payload, updated_at: new Date().toISOString() });
+      await client.from('nd_state').upsert({ org, blob: payload, updated_at: new Date().toISOString() });
     } catch (e) { console.warn('Auto cloud save failed', e); }
-  }, 1500), [settings.supabaseUrl, settings.supabaseAnon, settings.org]);
+  }, 1500), [settings.supabaseUrl, settings.supabaseAnon, settings.org, settings.apiBaseUrl]);
 
   useEffect(()=>{
     if (!settings?.supabaseAuto) return;
@@ -4071,8 +4077,6 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
             }}>Проверить</Button>
             <Button variant="outline" onClick={async()=>{
               try {
-                if (!window.supabase) throw new Error('Supabase не загружен');
-                const client = window.supabase.createClient(settings.supabaseUrl, settings.supabaseAnon);
                 const blob = {
                   version: (window.SCHEMA_VERSION||0),
                   rawItems: loadLS('nd_raw', []),
@@ -4088,8 +4092,17 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
                   clientId: loadLS('nd_client_id', null),
                   org: settings.org||'default',
                 };
-                const { error } = await client.from('nd_state').upsert({ org: settings.org||'default', blob, updated_at: new Date().toISOString() });
-                if (error) throw error; showToast('Сохранено в облако', 'success');
+                const base = normalizeApiBase(settings.apiBaseUrl||'');
+                if (base) {
+                  const r = await fetch(`${base}/api/state/upsert?org=${encodeURIComponent(settings.org||'default')}`, { method:'POST', headers:{ 'content-type':'application/json' }, body: JSON.stringify(blob) });
+                  if (!r.ok) throw new Error('Cloud save via Worker failed');
+                } else {
+                  if (!window.supabase) throw new Error('Supabase не загружен');
+                  const client = window.supabase.createClient(settings.supabaseUrl, settings.supabaseAnon);
+                  const { error } = await client.from('nd_state').upsert({ org: settings.org||'default', blob, updated_at: new Date().toISOString() });
+                  if (error) throw error;
+                }
+                showToast('Сохранено в облако', 'success');
               } catch (e) { console.error(e); showToast('Ошибка сохранения: ' + (e.message||e), 'danger'); }
             }}>Сохранить в облако</Button>
             <Button variant="outline" onClick={async()=>{
