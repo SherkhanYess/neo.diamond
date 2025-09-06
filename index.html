@@ -117,13 +117,10 @@ const defaultSettings = {
   // Параметры мастера
   allowSelfAssignMaster: true, // Разрешить мастеру брать задачу в работу
   showPickListDiamondsOnly: true, // Пик-лист только бриллиантов
-<<<<<<< ours
   // Уведомления
   notifyNewOrder: false,
   tgChatId: '',
   apiBaseUrl: '',
-=======
->>>>>>> theirs
 };
 const ROLE_PERMS = {
   admin: { rawEdit:true, rawAdjust:true, modelEdit:true, fgAdjust:true, ordersCreate:true, payments:true, process:true, financeView:true, ratesEdit:true, reset:true, purchaseCreate:true, purchaseProcess:true },
@@ -1629,26 +1626,26 @@ function OrdersBoard({ store }) {
     setOrders([ newOrder, ...orders ]);
     // Reserve diamonds on create
     reserveDiamonds(newOrder);
-<<<<<<< ours
     // Notify to Telegram (optional)
     try {
       if (settings.notifyNewOrder) {
-        const linesText = (newOrder.lines||[]).map((l, idx)=>{ const m=models.find(mm=>mm.id===l.modelId); return `${idx+1}. ${m?.name||'Модель'} — ${l.metal||m?.defaultMetal||''}/${l.color||m?.defaultColor||''} × ${l.qty||1}`; }).join('\n');
+        const linesText = (newOrder.lines||[]).map((l, idx)=>{
+          const m = models.find(mm=>mm.id===l.modelId);
+          return `${idx+1}. ${m?.name||'Модель'} — ${l.metal||m?.defaultMetal||''}/${l.color||m?.defaultColor||''} × ${l.qty||1}`;
+        }).join('\\n');
         const parts = [
           `🆕 <b>Новый заказ</b>`,
           `ID: <code>${id.slice(-6).toUpperCase()}</code>`,
           `Тип: ${newOrder.type}${newOrder.priority? ` · Приоритет: ${newOrder.priority}`:''}`,
-          newOrder.deadline? `Дедлайн: ${new Date(newOrder.deadline).toLocaleDateString('ru-RU')}` : null,
-          `Позиции:\n${linesText}`
+          (newOrder.deadline? `Дедлайн: ${new Date(newOrder.deadline).toLocaleDateString('ru-RU')}` : null),
+          `Позиции:\\n${linesText}`
         ].filter(Boolean);
-        const text = parts.join('\n');
+        const text = parts.join('\\n');
         const base = (settings.apiBaseUrl||'').replace(/\/$/, '');
         const url = base? `${base}/api/telegram/notify` : '/api/telegram/notify';
         fetch(url, { method:'POST', headers:{ 'content-type':'application/json' }, body: JSON.stringify({ text, chatId: settings.tgChatId||undefined, parse_mode:'HTML' }) }).catch(()=>{});
       }
     } catch (e) { console.warn('telegram notify error', e); }
-=======
->>>>>>> theirs
     if (order.initialPayment && order.initialPayment>0) {
       const method = order.initialPaymentMethod||"Kaspi";
       const currency = settings.currency;
