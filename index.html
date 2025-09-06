@@ -114,9 +114,10 @@ const defaultSettings = {
   org: 'default',
   supabaseAuto: true,
   supabaseCloudFirst: false,
-  // Второй API (внешний Supabase) для выгрузки каталога
-  secondSupabaseUrl: '',
-  secondSupabaseAnon: '',
+  // Внешний HTTP API для приёма каталога в JSON
+  externalApiUrl: '',
+  externalApiKey: '',      // Authorization: Bearer <key>
+  externalApiSecret: '',   // X-Shop-Signature: sha256=<hmac(body, secret)>
   // Параметры мастера
   allowSelfAssignMaster: true, // Разрешить мастеру брать задачу в работу
   showPickListDiamondsOnly: true, // Пик-лист только бриллиантов
@@ -904,12 +905,17 @@ function issueFG(jewelryStock, setJewelryStock, modelId, metal, color, qty) {
   setJewelryStock(next);
 }
 
-// ===== Выгрузка каталога во второй Supabase (products) =====
-async function syncProductsToSecondAPI(models, secondUrl, secondAnon) {
+// ===== Выгрузка каталога во второй Supabase (products) — REST без зависимостей =====
+async function syncProductsToSecondAPI(modelsInput, secondUrl, secondAnon) {
   try {
-    if (!window.supabase) throw new Error('supabase-js не загружен');
     if (!secondUrl || !secondAnon) throw new Error('Укажите URL и anon key второго Supabase');
-    const client = window.supabase.createClient(secondUrl, secondAnon);
+    const base = String(secondUrl).replace(/\/$/, '');
+    const api = (p) => `${base}/rest/v1${p.startsWith('/')? p: '/'+p}`;
+    const headers = {
+      'apikey': secondAnon,
+      'authorization': `Bearer ${secondAnon}`,
+      'content-type': 'application/json'
+    };
     const makeSkuForModel = (m) => {
       const base = String(m.name||'MODEL').replace(/\s+/g,'-').toUpperCase().slice(0,24);
       return m.sku || `SR-${base}`;
@@ -918,31 +924,127 @@ async function syncProductsToSecondAPI(models, secondUrl, secondAnon) {
       gold_img: (m?.photosByColor?.['Жёлтый']) || null,
       silver_img: (m?.photosByColor?.['Белый']) || null,
     });
-    const rows = (models||[]).map(m => {
-      const sku = makeSkuForModel(m);
-      const price = +(m.salesPrice||0);
-      const image_url = m.photoUrl || null;
-      const { gold_img, silver_img } = pickPhotos(m);
-      return {
-        sku,
-        name: m.name||'',
-        price,
-        image_url,
-        gold_img,
-        silver_img,
-        description: m.description||'',
-      };
-    });
+    const models = Array.isArray(modelsInput) ? modelsInput : (loadLS && loadLS('nd_models', [])) || [];
+    const rows = (models||[]).map(m => ({
+      sku: makeSkuForModel(m),
+      name: m.name||'',
+      price: +(m.salesPrice||0),
+      image_url: m.photoUrl || null,
+      ...pickPhotos(m),
+      description: m.description||'',
+    }));
     if (!rows.length) return { ok:true, rows:0, note:'Нет моделей для синхронизации' };
-    const { data, error } = await client
-      .from('products')
-      .upsert(rows, { onConflict: 'sku' })
-      .select();
-    if (error) return { ok:false, error };
-    return { ok:true, rows: Array.isArray(data)? data.length : 0 };
+
+    // Попытка upsert через PostgREST
+    const up = await fetch(api('/products?on_conflict=sku'), {
+      method: 'POST',
+      headers: { ...headers, 'Prefer': 'resolution=merge-duplicates,return=representation' },
+      body: JSON.stringify(rows)
+    });
+    const upJson = await up.json().catch(()=>null);
+    if (up.ok) return { ok:true, rows: Array.isArray(upJson)? upJson.length : rows.length };
+    console.warn('upsert REST failed', up.status, upJson);
+
+    // Фолбэк: читаем существующие sku и делаем update/insert
+    const ex = await fetch(api('/products?select=sku'), { headers });
+    if (!ex.ok) return { ok:false, error: { message: 'SELECT existing sku failed', status: ex.status, detail: await ex.text() } };
+    const exList = await ex.json();
+    const existing = new Set((exList||[]).map(x=>x.sku).filter(Boolean));
+    const toUpdate = rows.filter(r => r.sku && existing.has(r.sku));
+    const toInsert = rows.filter(r => !r.sku || !existing.has(r.sku));
+    // Обновления по одному
+    for (const r of toUpdate) {
+      const upd = await fetch(api(`/products?sku=eq.${encodeURIComponent(r.sku)}`), {
+        method: 'PATCH',
+        headers: { ...headers, 'Prefer': 'return=representation' },
+        body: JSON.stringify(r)
+      });
+      if (!upd.ok) return { ok:false, error: { message: 'UPDATE failed', sku: r.sku, status: upd.status, detail: await upd.text() } };
+    }
+    // Вставка пачкой
+    if (toInsert.length) {
+      const ins = await fetch(api('/products'), {
+        method: 'POST',
+        headers: { ...headers, 'Prefer': 'return=representation' },
+        body: JSON.stringify(toInsert)
+      });
+      if (!ins.ok) return { ok:false, error: { message: 'INSERT failed', status: ins.status, detail: await ins.text() } };
+    }
+    return { ok:true, rows: rows.length };
   } catch (e) {
     return { ok:false, error: { message: String(e?.message||e) } };
   }
+}
+
+// ===== Формирование каталога в JSON и отправка на внешний API =====
+function buildExportCatalog(modelsInput, jewelryStockInput, rawItemsInput) {
+  const models = Array.isArray(modelsInput) ? modelsInput : (loadLS && loadLS('nd_models', [])) || [];
+  const jewelryStock = Array.isArray(jewelryStockInput) ? jewelryStockInput : (loadLS && loadLS('nd_fg', [])) || [];
+  const rawItems = Array.isArray(rawItemsInput) ? rawItemsInput : (loadLS && loadLS('nd_raw', [])) || [];
+
+  const sumStock = (modelId, metal, color) => (jewelryStock||[])
+    .filter(j => j.modelId===modelId && j.metal===metal && j.color===color)
+    .reduce((s,j)=> s+(j.qty||0), 0);
+
+  const buildBOM = (m) => (m?.bom||[]).map(b => {
+    const r = rawItems.find(x=>x.id===b.rawItemId);
+    return { rawItemId: b.rawItemId, name: r?.name||null, category: r?.category||null, unit: r?.unit||null, qty: b.qty||0 };
+  });
+
+  const getVariants = (m) => (Array.isArray(m.variants) && m.variants.length>0)
+    ? m.variants
+    : (()=>{ const metals=(m.allowedMetals&&m.allowedMetals.length?m.allowedMetals:[m.defaultMetal||'Золото','Серебро']); const color=m.defaultColor||'Белый'; return metals.map(mt=>({ id:`virt-${m.id}-${mt}-${color}`, metal:mt, color, salesPrice:m.salesPrice||0, salesCurrency:m.salesCurrency||'KZT', photoUrl:m.photoUrl||null })); })();
+
+  const products = models.map(m => {
+    const variants = getVariants(m).map(v => ({
+      id: v.id || `var-${m.id}-${v.metal||m.defaultMetal}-${v.color||m.defaultColor}`,
+      sku: v.sku || null,
+      metal: v.metal || m.defaultMetal || 'Золото',
+      color: v.color || m.defaultColor || 'Белый',
+      price: +(v.salesPrice || m.salesPrice || 0),
+      currency: v.salesCurrency || m.salesCurrency || 'KZT',
+      stockQty: sumStock(m.id, v.metal||m.defaultMetal||'Золото', v.color||m.defaultColor||'Белый'),
+      photoUrl: (v.photosByColor?.[v.color]) || v.photoUrl || (m.photosByColor?.[v.color]) || m.photoUrl || null,
+      model3d: v.model3d || null,
+      model3dUsdz: v.model3dUsdz || null,
+    }));
+    return {
+      id: m.id,
+      sku: m.sku || null,
+      name: m.name || '',
+      type: m.type || '',
+      active: m.active!==false,
+      photoUrl: m.photoUrl || null,
+      bom: buildBOM(m),
+      variants
+    };
+  });
+  return { products };
+}
+
+async function hmacHeader(bodyText, secret) {
+  try {
+    if (!secret) return null;
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name:'HMAC', hash:'SHA-256' }, false, ['sign']);
+    const sig = await crypto.subtle.sign('HMAC', key, enc.encode(bodyText));
+    const hex = Array.from(new Uint8Array(sig)).map(b=>b.toString(16).padStart(2,'0')).join('');
+    return `sha256=${hex}`;
+  } catch { return null; }
+}
+
+async function exportCatalogToExternalAPI({ url, apiKey, secret, org='default' } = {}, models, jewelryStock, rawItems) {
+  if (!url) throw new Error('Укажите URL внешнего API');
+  const payload = { org, ...buildExportCatalog(models, jewelryStock, rawItems) };
+  const bodyText = JSON.stringify(payload);
+  const headers = { 'content-type': 'application/json' };
+  if (apiKey) headers['authorization'] = `Bearer ${apiKey}`;
+  else if (secret) { const sig = await hmacHeader(bodyText, secret); if (sig) headers['X-Shop-Signature'] = sig; }
+  const r = await fetch(url, { method:'POST', headers, body: bodyText });
+  const txt = await r.text();
+  let json = null; try { json = JSON.parse(txt); } catch {}
+  if (!r.ok) throw new Error(json?.error || txt || `HTTP ${r.status}`);
+  return json || { ok:true };
 }
 
 // ------- Главный компонент -------
@@ -4236,28 +4338,22 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
         </div>
 
         <div className="bg-white rounded-2xl border border-slate-200 p-4">
-          <div className="font-semibold mb-2">Второй API (Supabase) — Каталог</div>
+          <div className="font-semibold mb-2">Внешний API — Отправка каталога (JSON)</div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <Input label="Second Supabase URL" value={settings.secondSupabaseUrl||''} onChange={e=>setSettings({ ...settings, secondSupabaseUrl: e.target.value })} />
-            <label className="block text-sm mb-3">
-              <span className="block text-slate-600 mb-1">Second anon key</span>
-              <div className="flex items-center gap-2">
-                <input type="password" readOnly value={settings.secondSupabaseAnon? '••••••••':'не задан'} className="w-full rounded-xl border border-slate-300 px-3 py-2 bg-slate-50" />
-                <Button variant="outline" onClick={()=>{ const v=prompt('Введите/замените second anon key',''); if(v) setSettings({ ...settings, secondSupabaseAnon: v }); }}>Изменить</Button>
-              </div>
-            </label>
+            <Input label="External API URL" value={settings.externalApiUrl||''} onChange={e=>setSettings({ ...settings, externalApiUrl: e.target.value })} />
+            <Input label="External API key (Bearer, опц.)" value={settings.externalApiKey||''} onChange={e=>setSettings({ ...settings, externalApiKey: e.target.value })} />
+            <Input label="External API secret (HMAC, опц.)" value={settings.externalApiSecret||''} onChange={e=>setSettings({ ...settings, externalApiSecret: e.target.value })} />
           </div>
           <div className="flex items-center gap-2 mt-2">
             <Button variant="outline" onClick={async()=>{
               try{
-                if (!settings.secondSupabaseUrl || !settings.secondSupabaseAnon) { showToast('Заполните Second URL и anon key','warn'); return; }
-                const r = await syncProductsToSecondAPI(models, settings.secondSupabaseUrl, settings.secondSupabaseAnon);
-                if (!r.ok) throw new Error(r.error?.message || 'Ошибка синхронизации');
-                showToast(`Синхронизировано продуктов: ${r.rows||0}`,'success');
-              }catch(e){ showToast('Сбой синхронизации: ' + (e.message||e),'error'); }
-            }}>Синхронизировать каталог (products)</Button>
+                if (!settings.externalApiUrl) { showToast('Укажите External API URL','warn'); return; }
+                const res = await exportCatalogToExternalAPI({ url: settings.externalApiUrl, apiKey: settings.externalApiKey, secret: settings.externalApiSecret, org: settings.org||'default' });
+                showToast('Каталог отправлен: ' + (res?.ok===false? 'ошибка' : 'успех'),'success');
+              }catch(e){ showToast('Сбой отправки: ' + (e.message||e),'error'); }
+            }}>Отправить каталог (JSON)</Button>
           </div>
-          <div className="text-xs text-slate-500 mt-2">Выгружает текущие модели в таблицу public.products второго проекта. Требуется UNIQUE индекс по sku.</div>
+          <div className="text-xs text-slate-500 mt-2">Формирует products[] из текущих моделей и отправляет JSON на указанный URL. Авторизация: Bearer API key или HMAC (X-Shop-Signature).</div>
         </div>
         </>)}
       </div>
