@@ -52,6 +52,9 @@ const defaultSettings = {
   // Параметры мастера
   allowSelfAssignMaster: true, // Разрешить мастеру брать задачу в работу
   showPickListDiamondsOnly: true, // Пик-лист только бриллиантов
+  // Уведомления
+  notifyNewOrder: false,
+  tgChatId: '',
 };
 const ROLE_PERMS = {
   admin: { rawEdit:true, rawAdjust:true, modelEdit:true, fgAdjust:true, ordersCreate:true, payments:true, process:true, financeView:true, ratesEdit:true, reset:true, purchaseCreate:true, purchaseProcess:true },
@@ -1557,6 +1560,21 @@ function OrdersBoard({ store }) {
     setOrders([ newOrder, ...orders ]);
     // Reserve diamonds on create
     reserveDiamonds(newOrder);
+    // Notify to Telegram (optional)
+    try {
+      if (settings.notifyNewOrder) {
+        const linesText = (newOrder.lines||[]).map((l, idx)=>{ const m=models.find(mm=>mm.id===l.modelId); return `${idx+1}. ${m?.name||'Модель'} — ${l.metal||m?.defaultMetal||''}/${l.color||m?.defaultColor||''} × ${l.qty||1}`; }).join('\n');
+        const parts = [
+          `🆕 <b>Новый заказ</b>`,
+          `ID: <code>${id.slice(-6).toUpperCase()}</code>`,
+          `Тип: ${newOrder.type}${newOrder.priority? ` · Приоритет: ${newOrder.priority}`:''}`,
+          newOrder.deadline? `Дедлайн: ${new Date(newOrder.deadline).toLocaleDateString('ru-RU')}` : null,
+          `Позиции:\n${linesText}`
+        ].filter(Boolean);
+        const text = parts.join('\n');
+        fetch('/api/telegram/notify', { method:'POST', headers:{ 'content-type':'application/json' }, body: JSON.stringify({ text, chatId: settings.tgChatId||undefined, parse_mode:'HTML' }) }).catch(()=>{});
+      }
+    } catch (e) { console.warn('telegram notify error', e); }
     if (order.initialPayment && order.initialPayment>0) {
       const method = order.initialPaymentMethod||"Kaspi";
       const currency = settings.currency;
@@ -3753,6 +3771,7 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
             {[
               {k:'pricing',l:'Валюты/Наценки'},
               {k:'users',l:'Пользователи'},
+              {k:'notify',l:'Уведомления'},
               {k:'tech',l:'Технические'},
             ].map(x => (
               <button key={x.k} onClick={()=>setTab(x.k)} className={`text-left px-3 py-2 rounded-xl text-sm font-semibold ${tab===x.k? 'bg-slate-900 text-white':'bg-white border border-slate-300 text-slate-700'}`}>{x.l}</button>
@@ -3813,6 +3832,23 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
 
         {tab==='users' && (
           <UsersTab />
+        )}
+
+        {tab==='notify' && (
+          <div className="space-y-3">
+            <div className="font-semibold">Telegram</div>
+            <label className="inline-flex items-center gap-2">
+              <input type="checkbox" checked={!!settings.notifyNewOrder} onChange={e=>setSettings({ ...settings, notifyNewOrder: e.target.checked })} />
+              <span>Отправлять уведомления о новых заказах</span>
+            </label>
+            <Input label="Chat ID или @channelusername" value={settings.tgChatId||''} onChange={e=>setSettings({ ...settings, tgChatId: e.target.value })} />
+            <div className="flex items-center gap-2">
+              <Button variant="outline" onClick={async()=>{
+                try{ const r=await fetch('/api/telegram/notify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({text:'Тестовое уведомление Neo Diamond',chatId:settings.tgChatId||undefined})}); const j=await r.json(); if(!j.ok) throw new Error(j.error||'Ошибка'); showToast('Отправлено в Telegram','success'); }catch(e){ showToast('Ошибка Telegram: '+(e.message||e),'danger'); }
+              }}>Отправить тест</Button>
+            </div>
+            <div className="text-xs text-slate-500">Токен бота хранится на сервере (Cloudflare Worker). Задайте секрет TELEGRAM_BOT_TOKEN и (опц.) TELEGRAM_CHAT_ID.</div>
+          </div>
         )}
 
         

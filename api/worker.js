@@ -34,4 +34,23 @@ function json(data, status = 200, headers = {}) {
 async function safeJson(request) {
   try { return await request.json(); } catch { return null; }
 }
-
+      if (pathname === '/api/telegram/notify' && request.method === 'POST') {
+        const body = await safeJson(request) || {};
+        const token = env.TELEGRAM_BOT_TOKEN;
+        const chatId = body.chatId || env.TELEGRAM_CHAT_ID;
+        const text = String(body.text || '').slice(0, 4000);
+        const parseMode = body.parse_mode || body.parseMode || 'HTML';
+        if (!token) return json({ ok:false, error: 'TELEGRAM_BOT_TOKEN not configured' }, 400);
+        if (!chatId) return json({ ok:false, error: 'chatId is required' }, 400);
+        if (!text) return json({ ok:false, error: 'text is required' }, 400);
+        const resp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId, text, parse_mode: parseMode, disable_web_page_preview: true })
+        });
+        const data = await resp.json().catch(()=> ({}));
+        if (!resp.ok || !data?.ok) {
+          return json({ ok:false, error: data?.description || `Telegram error ${resp.status}` }, 502);
+        }
+        return json({ ok:true, result: data.result?.message_id || null });
+      }
