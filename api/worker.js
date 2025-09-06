@@ -30,6 +30,24 @@ export default {
         const inventory = buildInventory(state?.blob || {});
         return json({ ok:true, org, updatedAt: state?.updated_at || null, inventory });
       }
+      // Accept catalog JSON from admin and forward to shop backend to avoid CORS
+      if ((pathname === '/api/shop/catalog/export' || pathname === '/shop/catalog/export') && request.method === 'POST') {
+        const raw = await request.text();
+        let payload = null; try{ payload = JSON.parse(raw); }catch{}
+        if (!payload || typeof payload !== 'object') return json({ ok:false, error:'invalid_payload' }, 400);
+        const target = env.SHOP_CATALOG_URL || '';
+        if (!target) return json({ ok:false, error:'SHOP_CATALOG_URL not configured' }, 500);
+        try {
+          const h = await shopHeaders(env, raw);
+          const resp = await fetch(target, { method:'POST', headers: h, body: raw });
+          const text = await resp.text();
+          let j = null; try{ j = JSON.parse(text); }catch{}
+          if (!resp.ok) return json({ ok:false, status: resp.status, error: j?.error || text }, resp.status);
+          return json(j || { ok:true });
+        } catch (e) {
+          return json({ ok:false, error: String(e?.message||e) }, 502);
+        }
+      }
       if ((pathname === '/api/orders' || pathname === '/orders') && request.method === 'GET') {
         const org = url.searchParams.get('org') || 'default';
         const since = url.searchParams.get('since');
