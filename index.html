@@ -118,6 +118,8 @@ const defaultSettings = {
   externalApiUrl: '',
   externalApiKey: '',      // Authorization: Bearer <key>
   externalApiSecret: '',   // X-Shop-Signature: sha256=<hmac(body, secret)>
+  // Внешний HTTP API для приёма ПОЛНОГО состояния (state) в JSON
+  externalStateApiUrl: '',
   // Параметры мастера
   allowSelfAssignMaster: true, // Разрешить мастеру брать задачу в работу
   showPickListDiamondsOnly: true, // Пик-лист только бриллиантов
@@ -1038,7 +1040,38 @@ async function exportCatalogToExternalAPI({ url, apiKey, secret, org='default' }
   const payload = { org, ...buildExportCatalog(models, jewelryStock, rawItems) };
   const bodyText = JSON.stringify(payload);
   const headers = { 'content-type': 'application/json' };
-  if (apiKey) headers['authorization'] = `Bearer ${apiKey}`;
+  if (apiKey) { headers['authorization'] = `Bearer ${apiKey}`; headers['apikey'] = apiKey; headers['Prefer'] = 'return=representation'; }
+  else if (secret) { const sig = await hmacHeader(bodyText, secret); if (sig) headers['X-Shop-Signature'] = sig; }
+  const r = await fetch(url, { method:'POST', headers, body: bodyText });
+  const txt = await r.text();
+  let json = null; try { json = JSON.parse(txt); } catch {}
+  if (!r.ok) throw new Error(json?.error || txt || `HTTP ${r.status}`);
+  return json || { ok:true };
+}
+
+function buildFullStateJSON() {
+  return {
+    version: (window.SCHEMA_VERSION||0),
+    rawItems: loadLS('nd_raw', []),
+    models: loadLS('nd_models', []),
+    jewelryStock: loadLS('nd_fg', []),
+    orders: loadLS('nd_orders', []),
+    ledger: loadLS('nd_ledger', []),
+    settings: loadLS('nd_settings', defaultSettings),
+    suppliers: loadLS('nd_suppliers', []),
+    pos: loadLS('nd_pos', []),
+    services: loadLS('nd_services', []),
+    users: loadLS('nd_users', []),
+    savedAt: new Date().toISOString(),
+  };
+}
+
+async function exportFullStateToExternalAPI({ url, apiKey, secret, org='default' } = {}) {
+  if (!url) throw new Error('Укажите URL внешнего API (state)');
+  const payload = { org, state: buildFullStateJSON() };
+  const bodyText = JSON.stringify(payload);
+  const headers = { 'content-type': 'application/json' };
+  if (apiKey) { headers['authorization'] = `Bearer ${apiKey}`; headers['apikey'] = apiKey; headers['Prefer'] = 'return=representation'; }
   else if (secret) { const sig = await hmacHeader(bodyText, secret); if (sig) headers['X-Shop-Signature'] = sig; }
   const r = await fetch(url, { method:'POST', headers, body: bodyText });
   const txt = await r.text();
@@ -4337,24 +4370,7 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
           <div className="text-xs text-slate-500 mt-2">Подробности и SQL для таблиц см. в README.md (раздел Supabase).</div>
         </div>
 
-        <div className="bg-white rounded-2xl border border-slate-200 p-4">
-          <div className="font-semibold mb-2">Внешний API — Отправка каталога (JSON)</div>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <Input label="External API URL" value={settings.externalApiUrl||''} onChange={e=>setSettings({ ...settings, externalApiUrl: e.target.value })} />
-            <Input label="External API key (Bearer, опц.)" value={settings.externalApiKey||''} onChange={e=>setSettings({ ...settings, externalApiKey: e.target.value })} />
-            <Input label="External API secret (HMAC, опц.)" value={settings.externalApiSecret||''} onChange={e=>setSettings({ ...settings, externalApiSecret: e.target.value })} />
-          </div>
-          <div className="flex items-center gap-2 mt-2">
-            <Button variant="outline" onClick={async()=>{
-              try{
-                if (!settings.externalApiUrl) { showToast('Укажите External API URL','warn'); return; }
-                const res = await exportCatalogToExternalAPI({ url: settings.externalApiUrl, apiKey: settings.externalApiKey, secret: settings.externalApiSecret, org: settings.org||'default' });
-                showToast('Каталог отправлен: ' + (res?.ok===false? 'ошибка' : 'успех'),'success');
-              }catch(e){ showToast('Сбой отправки: ' + (e.message||e),'error'); }
-            }}>Отправить каталог (JSON)</Button>
-          </div>
-          <div className="text-xs text-slate-500 mt-2">Формирует products[] из текущих моделей и отправляет JSON на указанный URL. Авторизация: Bearer API key или HMAC (X-Shop-Signature).</div>
-        </div>
+        {/* Внешний API — секция удалена по запросу пользователя */}
         </>)}
       </div>
       </div>
