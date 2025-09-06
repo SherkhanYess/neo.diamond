@@ -7,10 +7,10 @@ export default {
       if (request.method === 'OPTIONS') {
         return new Response(null, { status: 204, headers: corsHeaders() });
       }
-      if (pathname === '/api/health') {
+      if (pathname === '/api/health' || pathname === '/health') {
         return json({ ok: true, ts: new Date().toISOString() });
       }
-      if (pathname === '/api/finolog/sync' && request.method === 'POST') {
+      if ((pathname === '/api/finolog/sync' || pathname === '/finolog/sync') && request.method === 'POST') {
         // Placeholder: here we would call Finolog API using env.FINOLOG_API_KEY
         // and payload from the client. For security, store tokens only in env.
         const body = await safeJson(request);
@@ -18,46 +18,43 @@ export default {
         return json({ ok: true, received: body||null });
       }
       // ---------- Bridge API for shop integration ----------
-      if (pathname === '/api/catalog' && request.method === 'GET') {
+      if ((pathname === '/api/catalog' || pathname === '/catalog') && request.method === 'GET') {
         const org = url.searchParams.get('org') || 'default';
         const state = await loadState(env, org);
-        if (!state) return json({ ok:false, error:'state_not_found' }, 404);
-        const { products } = buildCatalog(state.blob);
-        return json({ ok:true, org, updatedAt: state.updated_at, products });
+        const { products } = buildCatalog(state?.blob || {});
+        return json({ ok:true, org, updatedAt: state?.updated_at || null, products });
       }
-      if (pathname === '/api/inventory' && request.method === 'GET') {
+      if ((pathname === '/api/inventory' || pathname === '/inventory') && request.method === 'GET') {
         const org = url.searchParams.get('org') || 'default';
         const state = await loadState(env, org);
-        if (!state) return json({ ok:false, error:'state_not_found' }, 404);
-        const inventory = buildInventory(state.blob);
-        return json({ ok:true, org, updatedAt: state.updated_at, inventory });
+        const inventory = buildInventory(state?.blob || {});
+        return json({ ok:true, org, updatedAt: state?.updated_at || null, inventory });
       }
-      if (pathname === '/api/orders' && request.method === 'GET') {
+      if ((pathname === '/api/orders' || pathname === '/orders') && request.method === 'GET') {
         const org = url.searchParams.get('org') || 'default';
         const since = url.searchParams.get('since');
         const state = await loadState(env, org);
-        if (!state) return json({ ok:false, error:'state_not_found' }, 404);
-        const orders = Array.isArray(state.blob?.orders) ? state.blob.orders : [];
+        const orders = Array.isArray(state?.blob?.orders) ? state.blob.orders : [];
         const filtered = since ? orders.filter(o => (o.updatedAt||o.createdAt||'') > since) : orders;
         return json({ ok:true, org, count: filtered.length, orders: filtered });
       }
-      if (pathname === '/api/shop/orders/webhook' && request.method === 'POST') {
+      if ((pathname === '/api/shop/orders/webhook' || pathname === '/shop/orders/webhook') && request.method === 'POST') {
         const org = url.searchParams.get('org') || 'default';
         const raw = await request.text();
-        // HMAC verification (optional)
-        const secret = env.SHOP_WEBHOOK_SECRET || '';
-        if (secret) {
-          const sig = request.headers.get('x-shop-signature') || request.headers.get('x-signature') || '';
-          const ok = await verifyHmac(raw, secret, sig);
-          if (!ok) return json({ ok:false, error:'invalid_signature' }, 401);
-        }
+        // Authorization: accept either HMAC or Bearer
+        const authOk = await authorizeRequest(request, env, raw);
+        if (!authOk) return json({ ok:false, error:'unauthorized' }, 401);
         const body = parseJsonSafe(raw) || {};
         const state = await loadState(env, org);
-        if (!state) return json({ ok:false, error:'state_not_found' }, 404);
         const blob = state.blob || {};
         const models = Array.isArray(blob.models) ? blob.models : [];
         const rawItems = Array.isArray(blob.rawItems) ? blob.rawItems : [];
         const orders = Array.isArray(blob.orders) ? blob.orders : [];
+        // Idempotency by externalId
+        if (body.externalId) {
+          const existing = orders.find(o => (o.externalId||'') === body.externalId);
+          if (existing) return json({ ok:true, id: existing.id });
+        }
         const now = new Date().toISOString();
         const orderId = uid();
         const lines = Array.isArray(body.lines) ? body.lines.map(l => ({
@@ -89,20 +86,15 @@ export default {
         await saveState(env, org, nextBlob);
         return json({ ok:true, org, id: orderId });
       }
-      if (pathname === '/api/shop/orders/status' && request.method === 'POST') {
+      if ((pathname === '/api/shop/orders/status' || pathname === '/shop/orders/status') && request.method === 'POST') {
         const org = url.searchParams.get('org') || 'default';
         const raw = await request.text();
-        const secret = env.SHOP_WEBHOOK_SECRET || '';
-        if (secret) {
-          const sig = request.headers.get('x-shop-signature') || request.headers.get('x-signature') || '';
-          const ok = await verifyHmac(raw, secret, sig);
-          if (!ok) return json({ ok:false, error:'invalid_signature' }, 401);
-        }
+        const authOk = await authorizeRequest(request, env, raw);
+        if (!authOk) return json({ ok:false, error:'unauthorized' }, 401);
         const body = parseJsonSafe(raw) || {};
         const { externalId, status } = body;
         if (!externalId || !status) return json({ ok:false, error:'missing_fields' }, 400);
         const state = await loadState(env, org);
-        if (!state) return json({ ok:false, error:'state_not_found' }, 404);
         const blob = state.blob || {};
         const models = Array.isArray(blob.models) ? blob.models : [];
         const rawItems = Array.isArray(blob.rawItems) ? blob.rawItems : [];
@@ -161,7 +153,7 @@ export default {
         }
         return json({ ok:true, org });
       }
-      return new Response('Not Found', { status: 404, headers: corsHeaders() });
+      return json({ ok:false, error:'not_found' }, 404);
     } catch (e) {
       return json({ ok: false, error: String(e?.message || e) }, 500);
     }
@@ -182,7 +174,7 @@ function corsHeaders() {
   return {
     'access-control-allow-origin': '*',
     'access-control-allow-methods': 'GET,POST,OPTIONS',
-    'access-control-allow-headers': 'content-type'
+    'access-control-allow-headers': 'content-type,authorization,x-shop-signature'
   };
 }
 
@@ -190,11 +182,11 @@ function corsHeaders() {
 async function loadState(env, org='default') {
   const url = `${env.WMS_SUPABASE_URL}/rest/v1/nd_state?org=eq.${encodeURIComponent(org)}&select=blob,updated_at`;
   const r = await fetch(url, { headers: sbHeaders(env) });
-  if (!r.ok) return null;
+  if (!r.ok) return { blob: {}, updated_at: null };
   const arr = await r.json().catch(()=>[]);
   const row = arr && arr[0];
-  if (!row) return null;
-  return { blob: row.blob, updated_at: row.updated_at };
+  if (!row) return { blob: {}, updated_at: null };
+  return { blob: row.blob||{}, updated_at: row.updated_at||null };
 }
 async function saveState(env, org, blob) {
   const url = `${env.WMS_SUPABASE_URL}/rest/v1/nd_state`;
@@ -231,6 +223,8 @@ function buildCatalog(blob){
         currency: v.salesCurrency || m.salesCurrency || 'KZT',
         stockQty: sumStock(jewelryStock, m.id, metal, color),
         photoUrl: getPhotoUrl(m, v, color) || null,
+        model3d: v.model3d || null,
+        model3dUsdz: v.model3dUsdz || null,
       };
     });
     const bom = buildBOM(m, rawItems);
@@ -385,4 +379,21 @@ async function shopHeaders(env, bodyText){
     h['X-Shop-Signature'] = `sha256=${hex}`;
   }
   return h;
+}
+
+async function authorizeRequest(request, env, rawBody){
+  // Accept Bearer or HMAC (if configured). If neither configured, allow (dev).
+  const bearer = request.headers.get('authorization') || '';
+  if (env.SHOP_API_KEY && bearer.toLowerCase().startsWith('bearer ')){
+    const token = bearer.slice(7).trim();
+    if (timingSafeEqual(token, env.SHOP_API_KEY)) return true;
+  }
+  const secret = env.SHOP_WEBHOOK_SECRET || '';
+  if (secret && rawBody!=null){
+    const sig = request.headers.get('x-shop-signature') || request.headers.get('x-signature') || '';
+    const ok = await verifyHmac(rawBody, secret, sig);
+    if (ok) return true;
+  }
+  if (!env.SHOP_API_KEY && !env.SHOP_WEBHOOK_SECRET) return true;
+  return false;
 }
