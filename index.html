@@ -927,7 +927,7 @@ function NeoDiamondWMS() {
       if (s==='reorder') return <Section title="Рекомендации закупок"><ReorderRecommendations settings={settings} /></Section>;
     }
     if (section==='settings') return <Backup exportJSON={exportJSON} importJSON={importJSON} resetAll={resetAll} settings={settings} setSettings={setSettings} users={users} setUsers={setUsers} />;
-    if (section==='profile') return <Profile users={users} setUsers={setUsers} session={session} onLogout={()=>{ setSession(null); setSettings({ ...settings, role:'manager' }); }} settings={settings} setSettings={setSettings} />;
+    if (section==='profile') return <Profile users={users} setUsers={setUsers} session={session} onLogout={()=>{ setSession(null); setSettings({ ...settings, role:'manager' }); }} />;
     return null;
   };
 
@@ -3789,7 +3789,7 @@ function AnalyticsStockDaysModels({ models, jewelryStock, orders }) {
 // ------- Резерв/Настройки -------
 function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users, setUsers }) {
   const perms = ROLE_PERMS[settings.role] || ROLE_PERMS.admin;
-  const [tab, setTab] = React.useState('pricing'); // pricing | users | tech
+  const [tab, setTab] = React.useState('pricing'); // pricing | users | notify | tech
   const codes = Object.keys(settings.rates);
   const setRate = (code, val) => setSettings({ ...settings, rates: { ...settings.rates, [code]: +val || 0 } });
   const addCurrency = () => {
@@ -3861,6 +3861,7 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
             {[
               {k:'pricing',l:'Валюты/Наценки'},
               {k:'users',l:'Пользователи'},
+              {k:'notify',l:'Уведомления'},
               {k:'tech',l:'Технические'},
             ].map(x => (
               <button key={x.k} onClick={()=>setTab(x.k)} className={`text-left px-3 py-2 rounded-xl text-sm font-semibold ${tab===x.k? 'bg-slate-900 text-white':'bg-white border border-slate-300 text-slate-700'}`}>{x.l}</button>
@@ -3921,6 +3922,24 @@ function Backup({ exportJSON, importJSON, resetAll, settings, setSettings, users
 
         {tab==='users' && (
           <UsersTab />
+        )}
+
+        {tab==='notify' && (
+          <div className="space-y-3">
+            <div className="font-semibold">Telegram</div>
+            <label className="inline-flex items-center gap-2">
+              <input type="checkbox" checked={!!settings.notifyNewOrder} onChange={e=>setSettings({ ...settings, notifyNewOrder: e.target.checked })} />
+              <span>Отправлять уведомления о новых заказах</span>
+            </label>
+            <Input label="Chat ID или @channelusername" value={settings.tgChatId||''} onChange={e=>setSettings({ ...settings, tgChatId: e.target.value })} />
+            <Input label="API base URL (Workers)" value={settings.apiBaseUrl||''} onChange={e=>setSettings({ ...settings, apiBaseUrl: e.target.value })} />
+            <div className="flex items-center gap-2">
+              <Button variant="outline" onClick={async()=>{
+                try{ const base=(settings.apiBaseUrl||'').replace(/\/$/,''); const url= base? `${base}/api/telegram/notify` : '/api/telegram/notify'; const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({text:'Тестовое уведомление Neo Diamond',chatId:settings.tgChatId||undefined})}); const j=await r.json(); if(!j.ok) throw new Error(j.error||'Ошибка'); showToast('Отправлено в Telegram','success'); }catch(e){ showToast('Ошибка Telegram: '+(e.message||e),'error'); }
+              }}><Icon name="send"/> Отправить тест</Button>
+            </div>
+            <div className="text-xs text-slate-500">Токен бота хранится в Cloudflare Worker. Здесь укажите канал/чат и адрес воркера.</div>
+          </div>
         )}
 
         
